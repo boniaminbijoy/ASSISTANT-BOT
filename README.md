@@ -1,9 +1,20 @@
-ASSISTANT BOT - TikTok fixed build
+# ASSISTANT BOT - V5
 
-Deploy the contents of this folder. The TikTok downloader uses yt-dlp nightly with curl-cffi 0.16.0 and chrome-131 impersonation. FFmpeg is installed by the Dockerfile.
+Telegram bot with:
+- QR Code Scanner
+- QR Code Generator
+- TikTok Downloader
 
-If TikTok still rejects the Render IP, the bot will show the actual yt-dlp exception instead of "Unknown yt-dlp error". In that case a TikTok cookies file or a different outbound IP may be required.
+## V5 QR improvements
+- QR scanner uses OpenCV first and pyzbar/ZBar fallback.
+- Tries contrast, grayscale and threshold variants for difficult images.
+- Supports multiple QR codes in one image.
+- Supports Telegram photos and image documents.
+- Keeps the Telegram event loop responsive by running QR decoding/generation in a worker thread.
+- Uses unique temporary files so multiple users/scans do not overwrite each other.
+- QR generator keeps the bot logo small enough to preserve scan reliability.
+- QR generator supports Unicode text and arbitrary links.
+- TikTok fixes from V4 are preserved.
 
-
-## V3 fix
-The TikTok downloader converts the impersonation target string to yt-dlp\'s `ImpersonateTarget` object before passing it to the Python API. This fixes the `AssertionError: AssertionError()` seen with newer yt-dlp builds.
+## Deployment
+The Dockerfile installs `libzbar0`, which is required by pyzbar on Debian/Ubuntu-style Linux systems.

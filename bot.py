@@ -1,5 +1,8 @@
 import os
 import asyncio
+import html
+import tempfile
+import uuid
 from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
@@ -165,116 +168,78 @@ async def handle_qr_image(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    # ==========================================
-    # QR SCANNER MODE CHECK
-    # ==========================================
-
-    if not context.user_data.get(
-        "qr_mode",
-        False
-    ):
-
+    if not context.user_data.get("qr_mode", False):
         await update.message.reply_text(
             "ℹ️ **Please select 📷 QR CODE SCANNER first.**",
             reply_markup=get_main_keyboard(),
             parse_mode="Markdown"
         )
-
         return
 
-    # ==========================================
-    # SHOW DETECTING MESSAGE
-    # ==========================================
-
     detecting_message = await update.message.reply_text(
-        "🔍 **Detecting QR Code...**\n\n"
-        "⏳ Please wait...",
+        "🔍 **Detecting QR Code...**\n\n⏳ Please wait...",
         parse_mode="Markdown"
     )
 
-    # ==========================================
-    # GET IMAGE
-    # ==========================================
-
-    photo = update.message.photo[-1]
-
-    file = await context.bot.get_file(
-        photo.file_id
-    )
-
-    image_path = (
-        f"qr_{update.message.from_user.id}.jpg"
-    )
-
-    # Download image
-    await file.download_to_drive(
-        image_path
-    )
+    user_id = update.message.from_user.id
+    temp_dir = tempfile.mkdtemp(prefix=f"qr_scan_{user_id}_")
+    image_path = os.path.join(temp_dir, f"scan_{uuid.uuid4().hex}.jpg")
 
     try:
-
-        # ==========================================
-        # 2 SECOND DETECTING DELAY
-        # ==========================================
-
-        await asyncio.sleep(2)
-
-        # ==========================================
-        # SCAN QR CODE
-        # ==========================================
-
-        result = scan_qr(
-            image_path
-        )
-
-        # ==========================================
-        # QR FOUND
-        # ==========================================
-
-        if result:
-
+        if update.message.photo:
+            media = update.message.photo[-1]
+        elif update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith("image/"):
+            media = update.message.document
+        else:
             await detecting_message.edit_text(
-                "✅ **QR CODE DETECTED!**\n\n"
-                "🔗 **Result:**\n\n"
-                f"`{result}`\n\n"
-                "📷 Send another QR image to scan again.",
+                "❌ **Please send an image containing a QR code.**",
                 parse_mode="Markdown"
             )
+            return
 
-        # ==========================================
-        # QR NOT FOUND
-        # ==========================================
+        file = await context.bot.get_file(media.file_id)
+        await file.download_to_drive(image_path)
 
-        else:
+        # QR decoding is CPU-bound; keep the Telegram event loop responsive.
+        results = await asyncio.to_thread(scan_qr, image_path)
+
+        if results:
+            lines = []
+            for index, result in enumerate(results, 1):
+                safe = html.escape(result)
+                lines.append(f"**{index}.** <code>{safe}</code>")
 
             await detecting_message.edit_text(
-                "❌ **QR CODE NOT FOUND**\n\n"
+                "✅ <b>QR CODE DETECTED!</b>\n\n"
+                + "\n\n".join(lines)
+                + "\n\n📷 Send another QR image to scan again.",
+                parse_mode="HTML"
+            )
+        else:
+            await detecting_message.edit_text(
+                "❌ <b>QR CODE NOT FOUND</b>\n\n"
                 "I couldn't find a readable QR Code in this image.\n\n"
-                "💡 Try sending a clearer image.",
-                parse_mode="Markdown"
+                "💡 Try a clearer, brighter image or send the image as a photo.",
+                parse_mode="HTML"
             )
 
     except Exception as e:
-
-        print(
-            "QR Scanner Error:",
-            e
-        )
-
-        await detecting_message.edit_text(
-            "❌ **QR SCAN FAILED**\n\n"
-            "Something went wrong while scanning the image.",
-            parse_mode="Markdown"
-        )
-
-    finally:
-
-        # Delete temporary image
-        if os.path.exists(image_path):
-
-            os.remove(
-                image_path
+        print("QR Scanner Error:", repr(e))
+        try:
+            await detecting_message.edit_text(
+                "❌ <b>QR SCAN FAILED</b>\n\n"
+                f"<code>{html.escape(type(e).__name__ + ': ' + str(e))}</code>",
+                parse_mode="HTML"
             )
+        except Exception:
+            pass
+    finally:
+        try:
+            if os.path.exists(image_path):
+                os.remove(image_path)
+            os.rmdir(temp_dir)
+        except OSError:
+            pass
 
 
 # ==================================================
@@ -353,125 +318,71 @@ async def handle_qr_generator_text(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    data = update.message.text.strip()
-
-    # Empty text
+    data = (update.message.text or "").strip()
     if not data:
-
         await update.message.reply_text(
             "❌ Please send some text or a link.",
             reply_markup=get_main_keyboard()
         )
-
         return
 
-    # Show generating message
     generating_message = await update.message.reply_text(
-        "🔳 **Generating QR Code...**\n\n"
-        "⏳ Please wait...",
+        "🔳 **Generating QR Code...**\n\n⏳ Please wait...",
         parse_mode="Markdown"
     )
 
     user_id = update.message.from_user.id
-
-    logo_path = (
-        f"bot_logo_{user_id}.jpg"
-    )
-
-    qr_path = (
-        f"generated_qr_{user_id}.png"
-    )
+    temp_dir = tempfile.mkdtemp(prefix=f"qr_gen_{user_id}_")
+    logo_path = os.path.join(temp_dir, "bot_logo.jpg")
+    qr_path = os.path.join(temp_dir, "generated_qr.png")
 
     try:
+        logo_found = await download_bot_profile_picture(context, logo_path)
 
-        # ==========================================
-        # DOWNLOAD BOT PROFILE PICTURE
-        # ==========================================
-
-        logo_found = await download_bot_profile_picture(
-            context,
-            logo_path
+        await asyncio.to_thread(
+            generate_qr,
+            data,
+            qr_path,
+            logo_path if logo_found else None
         )
 
-        # ==========================================
-        # GENERATE QR WITH BOT LOGO
-        # ==========================================
-
-        if logo_found:
-
-            generate_qr(
-                data,
-                qr_path,
-                logo_path
-            )
-
-        else:
-
-            # If bot has no profile picture
-            generate_qr(
-                data,
-                qr_path
-            )
-
-        # Delete generating message
         await generating_message.delete()
 
-        # ==========================================
-        # SEND QR CODE
-        # ==========================================
-
-        with open(
-            qr_path,
-            "rb"
-        ) as qr_file:
-
+        safe_data = html.escape(data)
+        with open(qr_path, "rb") as qr_file:
             await update.message.reply_photo(
                 photo=qr_file,
-
                 caption=(
-                    "✅ **QR CODE GENERATED!**\n\n"
-                    "🔗 **Data:**\n"
-                    f"`{data}`"
+                    "✅ <b>QR CODE GENERATED!</b>\n\n"
+                    "🔗 <b>Data:</b>\n"
+                    f"<code>{safe_data}</code>"
                 ),
-
                 reply_markup=get_main_keyboard(),
-
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
 
     except Exception as e:
-
-        print(
-            "QR Generator Error:",
-            e
-        )
-
-        await generating_message.edit_text(
-            "❌ **QR GENERATION FAILED**\n\n"
-            "Something went wrong. Please try again.",
-            parse_mode="Markdown"
-        )
-
+        print("QR Generator Error:", repr(e))
+        try:
+            await generating_message.edit_text(
+                "❌ <b>QR GENERATION FAILED</b>\n\n"
+                f"<code>{html.escape(type(e).__name__ + ': ' + str(e))}</code>",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
     finally:
-
-        # Delete temporary logo
-        if os.path.exists(logo_path):
-
-            os.remove(
-                logo_path
-            )
-
-        # Delete temporary QR
-        if os.path.exists(qr_path):
-
-            os.remove(
-                qr_path
-            )
-
-        # Reset generator data
-        context.user_data[
-            "qr_generator_data"
-        ] = None
+        for path in (logo_path, qr_path):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
+        try:
+            os.rmdir(temp_dir)
+        except OSError:
+            pass
+        context.user_data["qr_generator_data"] = None
 
 
 # ==================================================
@@ -486,8 +397,7 @@ async def handle_qr_generator_image(
     await update.message.reply_text(
         "ℹ️ **QR CODE GENERATOR**\n\n"
         "You only need to send text or a link.\n\n"
-        "🤖 The bot will automatically add "
-        "its own profile picture to the QR Code.",
+        "🤖 The bot will automatically add its own profile picture to the QR Code.",
         reply_markup=get_main_keyboard(),
         parse_mode="Markdown"
     )
@@ -945,6 +855,26 @@ async def handle_text(
         return
 
     # ==========================================
+    # TIKTOK LINK (must be checked before quality)
+    # ==========================================
+    # After the first video, tiktok_url may still exist while the
+    # downloader is waiting for/handling the next message. If we check
+    # tiktok_url first, a new TikTok URL is mistakenly sent to the
+    # quality handler and silently ignored. Detect a new TikTok URL first.
+
+    if (
+        context.user_data.get("tiktok_mode", False)
+        and is_tiktok_url(text)
+    ):
+
+        await handle_tiktok_link(
+            update,
+            context
+        )
+
+        return
+
+    # ==========================================
     # TIKTOK QUALITY
     # ==========================================
 
@@ -960,7 +890,7 @@ async def handle_text(
         return
 
     # ==========================================
-    # TIKTOK LINK
+    # TIKTOK MODE (non-URL input)
     # ==========================================
 
     if context.user_data.get(
@@ -989,6 +919,15 @@ async def handle_text(
             context
         )
 
+        return
+
+    # QR scanner mode + text input
+    if context.user_data.get("qr_mode", False):
+        await update.message.reply_text(
+            "📷 **QR CODE SCANNER**\n\nPlease send a photo/image containing the QR code.",
+            reply_markup=get_main_keyboard(),
+            parse_mode="Markdown"
+        )
         return
 
 
@@ -1033,7 +972,7 @@ def main():
 
     app.add_handler(
         MessageHandler(
-            filters.PHOTO,
+            filters.PHOTO | filters.Document.IMAGE,
             handle_qr_image
         )
     )

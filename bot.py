@@ -300,6 +300,8 @@ def admin_keyboard():
         [InlineKeyboardButton("🔍 Search User", callback_data="admin_search"), InlineKeyboardButton("📈 Reports", callback_data="admin_reports")],
         [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"), InlineKeyboardButton("🔧 Maintenance", callback_data="admin_maintenance")],
         [InlineKeyboardButton("📣 Announcement", callback_data="admin_announce"), InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings")],
+        [InlineKeyboardButton(f"🔧 M:{'ON' if maintenance_enabled() else 'OFF'}", callback_data="set_maintenance_toggle"), InlineKeyboardButton(f"🎵 D:{'ON' if feature_enabled('downloader') else 'OFF'}", callback_data="set_downloader_toggle")],
+        [InlineKeyboardButton(f"📷 S:{'ON' if feature_enabled('qr_scanner') else 'OFF'}", callback_data="set_scanner_toggle"), InlineKeyboardButton(f"🔲 G:{'ON' if feature_enabled('qr_generator') else 'OFF'}", callback_data="set_generator_toggle")],
         [InlineKeyboardButton("🧪 System Status", callback_data="admin_status")],
         [InlineKeyboardButton("🏠 Home", callback_data="ui_home")],
     ])
@@ -479,7 +481,7 @@ async def helpadmin_command(update, context):
 async def status_command(update, context):
     """Admin-only live registry/status page for commands and button features."""
     if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text('⛔ Admin only.')
+        # /status is intentionally silent for normal users.
         return
 
     commands = [

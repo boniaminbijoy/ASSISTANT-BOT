@@ -76,6 +76,27 @@ def init_database():
         cols = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
         if "language" not in cols:
             conn.execute("ALTER TABLE users ADD COLUMN language TEXT DEFAULT 'en'")
+        conn.execute("""CREATE TABLE IF NOT EXISTS download_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+            platform TEXT NOT NULL, url TEXT NOT NULL, quality TEXT DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'success', created_at TEXT NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS qr_scan_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+            content TEXT NOT NULL, created_at TEXT NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS qr_generate_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+            content TEXT NOT NULL, created_at TEXT NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS user_activity (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+            action TEXT NOT NULL, details TEXT DEFAULT '', created_at TEXT NOT NULL
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_download_history_user ON download_history(user_id, id DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_qr_scan_history_user ON qr_scan_history(user_id, id DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_qr_generate_history_user ON qr_generate_history(user_id, id DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_user_activity_user ON user_activity(user_id, id DESC)")
         conn.commit()
 
 def utc_now():
@@ -119,6 +140,54 @@ def set_user_language(user_id, language):
 def get_user_stats(user_id):
     with db_connect() as conn:
         return conn.execute("SELECT messages, qr_scans, qr_generated, tiktok_downloads FROM users WHERE user_id = ?", (user_id,)).fetchone() or (0, 0, 0, 0)
+
+def log_activity(user_id, action, details=""):
+    try:
+        with db_connect() as conn:
+            conn.execute("INSERT INTO user_activity(user_id, action, details, created_at) VALUES (?, ?, ?, ?)",
+                         (user_id, action[:80], str(details)[:500], utc_now()))
+            conn.commit()
+    except Exception as exc:
+        print("Activity log error:", repr(exc))
+
+def add_download_history(user_id, url, quality="", status="success"):
+    with db_connect() as conn:
+        conn.execute("INSERT INTO download_history(user_id, platform, url, quality, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                     (user_id, "TikTok", url[:1000], str(quality)[:50], status[:30], utc_now()))
+        conn.commit()
+
+def add_qr_scan_history(user_id, content):
+    with db_connect() as conn:
+        conn.execute("INSERT INTO qr_scan_history(user_id, content, created_at) VALUES (?, ?, ?)",
+                     (user_id, str(content)[:4000], utc_now()))
+        conn.commit()
+
+def add_qr_generate_history(user_id, content):
+    with db_connect() as conn:
+        conn.execute("INSERT INTO qr_generate_history(user_id, content, created_at) VALUES (?, ?, ?)",
+                     (user_id, str(content)[:4000], utc_now()))
+        conn.commit()
+
+def get_user_profile(user_id):
+    with db_connect() as conn:
+        return conn.execute("SELECT user_id, username, first_name, joined_at, last_seen, language FROM users WHERE user_id = ?", (user_id,)).fetchone()
+
+def get_history(user_id, kind, limit=10):
+    tables = {
+        "downloads": ("download_history", "platform, url, quality, status, created_at"),
+        "scans": ("qr_scan_history", "content, created_at"),
+        "generates": ("qr_generate_history", "content, created_at"),
+        "activity": ("user_activity", "action, details, created_at"),
+    }
+    table, fields = tables[kind]
+    with db_connect() as conn:
+        return conn.execute(f"SELECT {fields} FROM {table} WHERE user_id = ? ORDER BY id DESC LIMIT ?", (user_id, limit)).fetchall()
+
+def format_dt(value):
+    try:
+        return value.replace("T", " ").replace("+00:00", " UTC")
+    except Exception:
+        return str(value)
 
 def get_stats():
     with db_connect() as conn:
@@ -204,6 +273,19 @@ async def admin_callback(update, context):
 async def track_update(update, context):
     if update.effective_user:
         register_user(update.effective_user, count_message=bool(update.effective_message))
+        try:
+            if update.callback_query:
+                action = "button_click"
+                details = update.callback_query.data or ""
+            elif update.message:
+                action = "message"
+                details = (update.message.text or "media")[:500]
+            else:
+                action = "update"
+                details = type(update).__name__
+            log_activity(update.effective_user.id, action, details)
+        except Exception:
+            pass
 
 
 # ==================================================
@@ -230,6 +312,87 @@ def start_web_server():
 
 
 # ==================================================
+# USER PROFILE / HISTORY / ACTIVITY
+# ==================================================
+
+def user_features_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👤 My Profile", callback_data="user_profile"),
+         InlineKeyboardButton("📊 My Statistics", callback_data="user_stats")],
+        [InlineKeyboardButton("📥 Download History", callback_data="hist_downloads")],
+        [InlineKeyboardButton("📷 QR Scan History", callback_data="hist_scans"),
+         InlineKeyboardButton("🔲 QR Generate History", callback_data="hist_generates")],
+        [InlineKeyboardButton("🕘 Activity", callback_data="hist_activity")],
+        [InlineKeyboardButton("🏠 Home", callback_data="ui_home")],
+    ])
+
+async def user_profile_command(update, context):
+    user = update.effective_user
+    row = get_user_profile(user.id)
+    if not row:
+        register_user(user)
+        row = get_user_profile(user.id)
+    uid, username, first_name, joined, last_seen, language = row
+    log_activity(uid, "view_profile")
+    username_text = f"@{html.escape(username)}" if username else "—"
+    text = (
+        "👤 <b>MY PROFILE</b>\n\n"
+        f"🆔 <b>Telegram ID:</b> <code>{uid}</code>\n"
+        f"👤 <b>Name:</b> {html.escape(first_name or '—')}\n"
+        f"🔗 <b>Username:</b> {username_text}\n"
+        f"📅 <b>Joined:</b> {html.escape(format_dt(joined))}\n"
+        f"🟢 <b>Last active:</b> {html.escape(format_dt(last_seen))}\n"
+        f"🌐 <b>Language:</b> {'বাংলা' if language == 'bn' else 'English'}"
+    )
+    await update.effective_message.reply_text(text, parse_mode="HTML", reply_markup=user_features_keyboard())
+
+async def user_stats_view(update, context):
+    user = update.effective_user
+    messages, scans, generated, downloads = get_user_stats(user.id)
+    activity_count = get_history(user.id, "activity", 999999)
+    log_activity(user.id, "view_stats")
+    text = (
+        "📊 <b>MY STATISTICS</b>\n\n"
+        f"💬 Messages: <b>{messages}</b>\n"
+        f"🎵 TikTok Downloads: <b>{downloads}</b>\n"
+        f"📷 QR Scans: <b>{scans}</b>\n"
+        f"🔲 QR Generated: <b>{generated}</b>\n"
+        f"🕘 Activity Records: <b>{len(activity_count)}</b>"
+    )
+    await update.effective_message.reply_text(text, parse_mode="HTML", reply_markup=user_features_keyboard())
+
+def history_text(user_id, kind):
+    rows = get_history(user_id, kind, 10)
+    titles = {
+        "downloads": "📥 DOWNLOAD HISTORY", "scans": "📷 QR SCAN HISTORY",
+        "generates": "🔲 QR GENERATE HISTORY", "activity": "🕘 USER ACTIVITY"
+    }
+    if not rows:
+        return f"<b>{titles[kind]}</b>\n\nNo records yet."
+    lines = [f"<b>{titles[kind]}</b>\n"]
+    for i, row in enumerate(rows, 1):
+        if kind == "downloads":
+            platform, url, quality, status, created = row
+            lines.append(f"<b>{i}.</b> 🎵 {html.escape(platform)} | {html.escape(status)} | {html.escape(quality or 'auto')}\n🔗 <code>{html.escape(url)}</code>\n🕘 {html.escape(format_dt(created))}")
+        elif kind in {"scans", "generates"}:
+            content, created = row
+            lines.append(f"<b>{i}.</b> <code>{html.escape(content[:800])}</code>\n🕘 {html.escape(format_dt(created))}")
+        else:
+            action, details, created = row
+            lines.append(f"<b>{i}.</b> {html.escape(action)} — {html.escape(details[:300])}\n🕘 {html.escape(format_dt(created))}")
+    lines.append("\nShowing the latest 10 records.")
+    return "\n\n".join(lines)
+
+async def history_view(update, context, kind):
+    user = update.effective_user
+    log_activity(user.id, f"view_{kind}_history")
+    await update.effective_message.reply_text(history_text(user.id, kind), parse_mode="HTML", reply_markup=user_features_keyboard())
+
+async def user_features_command(update, context):
+    log_activity(update.effective_user.id, "open_user_features")
+    await update.effective_message.reply_text("👤 <b>MY ACCOUNT</b>\n\nChoose what you want to view:", parse_mode="HTML", reply_markup=user_features_keyboard())
+
+# ==================================================
 # MAIN MENU
 # ==================================================
 
@@ -237,6 +400,7 @@ def get_main_keyboard(language="en"):
     keyboard = [
         ["📥 Downloader", "📷 QR Scanner"],
         ["🔲 QR Generator", "📊 My Stats"],
+        ["👤 My Profile", "🕘 My History"],
         ["⚙️ Settings", "❓ Help"],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -277,6 +441,29 @@ async def ui_callback(update, context):
             reply_markup=get_main_keyboard(get_user_language(user.id)),
             parse_mode="Markdown"
         )
+    elif query.data == "user_profile":
+        row = get_user_profile(user.id)
+        if not row:
+            register_user(user)
+            row = get_user_profile(user.id)
+        uid, username, first_name, joined, last_seen, language = row
+        log_activity(user.id, "view_profile")
+        username_text = f"@{html.escape(username)}" if username else "—"
+        text = (f"👤 <b>MY PROFILE</b>\n\n🆔 <b>Telegram ID:</b> <code>{uid}</code>\n"
+                f"👤 <b>Name:</b> {html.escape(first_name or '—')}\n"
+                f"🔗 <b>Username:</b> {username_text}\n"
+                f"📅 <b>Joined:</b> {html.escape(format_dt(joined))}\n"
+                f"🟢 <b>Last active:</b> {html.escape(format_dt(last_seen))}")
+        await query.message.reply_text(text, parse_mode="HTML", reply_markup=user_features_keyboard())
+    elif query.data == "user_stats":
+        messages, scans, generated, downloads = get_user_stats(user.id)
+        log_activity(user.id, "view_stats")
+        await query.message.reply_text(f"📊 <b>MY STATISTICS</b>\n\n💬 Messages: <b>{messages}</b>\n🎵 TikTok Downloads: <b>{downloads}</b>\n📷 QR Scans: <b>{scans}</b>\n🔲 QR Generated: <b>{generated}</b>", parse_mode="HTML", reply_markup=user_features_keyboard())
+    elif query.data.startswith("hist_"):
+        kind = query.data.replace("hist_", "", 1)
+        if kind in {"downloads", "scans", "generates", "activity"}:
+            await query.message.reply_text(history_text(user.id, kind), parse_mode="HTML", reply_markup=user_features_keyboard())
+            log_activity(user.id, f"view_{kind}_history")
     elif query.data in {"lang_bn", "lang_en"}:
         lang = "bn" if query.data == "lang_bn" else "en"
         set_user_language(user.id, lang)
@@ -303,6 +490,10 @@ async def ui_text_action(update, context, text):
         messages, scans, generated, downloads = get_user_stats(user.id)
         msg = f"📊 *My Statistics*\n\n💬 Messages: *{messages}*\n📷 QR Scans: *{scans}*\n🔲 QR Generated: *{generated}*\n🎵 TikTok Downloads: *{downloads}*"
         await update.message.reply_text(msg, reply_markup=get_main_keyboard(lang), parse_mode="Markdown"); return True
+    if text == "👤 My Profile":
+        await user_profile_command(update, context); return True
+    if text == "🕘 My History":
+        await user_features_command(update, context); return True
     if text == "⚙️ Settings":
         await settings_command(update, context); return True
     if text == "❓ Help":
@@ -433,6 +624,7 @@ async def handle_qr_image(
             increment_stat(update.effective_user.id, "qr_scans")
             lines = []
             for index, result in enumerate(results, 1):
+                add_qr_scan_history(update.effective_user.id, result)
                 safe = html.escape(result)
                 lines.append(f"**{index}.** <code>{safe}</code>")
 
@@ -608,6 +800,7 @@ async def handle_qr_generator_text(
         safe_data = html.escape(data)
         with open(qr_path, "rb") as qr_file:
             increment_stat(update.effective_user.id, "qr_generated")
+            add_qr_generate_history(update.effective_user.id, data)
             await update.message.reply_photo(
                 photo=qr_file,
                 caption=(
@@ -1075,6 +1268,7 @@ async def handle_tiktok_quality(
             )
 
         increment_stat(update.effective_user.id, "tiktok_downloads")
+        add_download_history(update.effective_user.id, context.user_data.get("tiktok_url") or "", selected_height, "success")
 
         # Delete status message
         await downloading_message.delete()
@@ -1085,6 +1279,10 @@ async def handle_tiktok_quality(
             "TikTok Download Error:",
             e
         )
+        try:
+            add_download_history(update.effective_user.id, context.user_data.get("tiktok_url") or "", selected_height if 'selected_height' in locals() else "", "failed")
+        except Exception:
+            pass
 
         await downloading_message.edit_text(
             "❌ **Download failed.**\n\n"
@@ -1282,6 +1480,9 @@ def main():
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("profile", user_profile_command))
+    app.add_handler(CommandHandler("mystats", user_stats_view))
+    app.add_handler(CommandHandler("history", user_features_command))
     app.add_handler(CallbackQueryHandler(ui_callback, pattern=r"^(ui_|lang_)"))
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin_"))
 

@@ -26,7 +26,7 @@ The user database is stored in `bot_data.db`. For persistent storage across Rend
 - `ADMIN_IDS` accepts comma-separated numeric IDs (semicolon separators are also accepted).
 
 
-## V15 Professional UI
+## V16 Professional UI
 - Redesigned /start main menu
 - Inline downloader selection
 - Settings menu
@@ -35,3 +35,15 @@ The user database is stored in `bot_data.db`. For persistent storage across Rend
 - Help menu
 - Home/back-to-home navigation
 - Legacy button labels remain supported
+
+
+## V16 – User Features
+- 👤 My Profile
+- 📊 My Statistics
+- 📥 Download History (latest 10)
+- 📷 QR Scan History (latest 10)
+- 🔲 QR Generate History (latest 10)
+- 🕘 User activity tracking
+- Commands: `/profile`, `/mystats`, `/history`
+
+New SQLite tables are created automatically on startup; existing user/admin data is preserved.

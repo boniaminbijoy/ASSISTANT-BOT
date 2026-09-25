@@ -45,7 +45,19 @@ if not BOT_TOKEN:
 # PHASE 3 - USER DATABASE / ADMIN CONFIG
 # ==================================================
 DB_PATH = os.environ.get("BOT_DB_PATH", "bot_data.db")
-ADMIN_IDS = {int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
+ADMIN_IDS = {int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").replace(";", ",").split(",") if x.strip().isdigit()}
+
+
+async def myid_command(update, context):
+    """Show the Telegram numeric user ID needed for ADMIN_IDS."""
+    user = update.effective_user
+    if not user:
+        return
+    await update.effective_message.reply_text(
+        f"🆔 Your Telegram User ID is:\n\n`{user.id}`\n\n"
+        "Use this number in Render → Environment → ADMIN_IDS, then redeploy the bot.",
+        parse_mode="Markdown"
+    )
 
 def db_connect():
     conn = sqlite3.connect(DB_PATH, timeout=30)
@@ -104,7 +116,12 @@ def admin_keyboard():
 
 async def admin_panel(update, context):
     if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text("⛔ You are not authorized to use the admin panel.")
+        await update.effective_message.reply_text(
+            f"⛔ You are not authorized to use the admin panel.\n\n"
+            f"🆔 Your Telegram ID: `{update.effective_user.id}`\n\n"
+            "Add this number to Render → Environment → ADMIN_IDS, then redeploy.",
+            parse_mode="Markdown"
+        )
         return
     await update.effective_message.reply_text(
         "🛠️ *ADMIN PANEL*\n\nChoose an option:", reply_markup=admin_keyboard(), parse_mode="Markdown")
@@ -1205,6 +1222,8 @@ def main():
     # Phase 3: track every update before normal handlers
     app.add_handler(MessageHandler(filters.ALL, track_update), group=-1)
 
+    app.add_handler(CommandHandler("myid", myid_command))
+    app.add_handler(CommandHandler("id", myid_command))
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))

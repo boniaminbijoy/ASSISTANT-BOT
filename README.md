@@ -18,3 +18,9 @@ The user database is stored in `bot_data.db`. For persistent storage across Rend
 - `/admin` — admin panel
 - `/stats` — statistics
 - `/broadcast Your message` — broadcast to registered users
+
+
+## V14 additions
+- `/myid` (and `/id`) shows your Telegram numeric User ID for configuring `ADMIN_IDS`.
+- Unauthorized `/admin` now also shows your current Telegram ID to make admin setup easier.
+- `ADMIN_IDS` accepts comma-separated numeric IDs (semicolon separators are also accepted).

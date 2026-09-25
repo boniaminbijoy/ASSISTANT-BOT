@@ -315,6 +315,12 @@ def start_web_server():
 # USER PROFILE / HISTORY / ACTIVITY
 # ==================================================
 
+def profile_keyboard():
+    """Keyboard shown on My Profile: profile only, without history options."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏠 Home", callback_data="ui_home")],
+    ])
+
 def user_features_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👤 My Profile", callback_data="user_profile"),
@@ -344,7 +350,7 @@ async def user_profile_command(update, context):
         f"🟢 <b>Last active:</b> {html.escape(format_dt(last_seen))}\n"
         f"🌐 <b>Language:</b> {'বাংলা' if language == 'bn' else 'English'}"
     )
-    await update.effective_message.reply_text(text, parse_mode="HTML", reply_markup=user_features_keyboard())
+    await update.effective_message.reply_text(text, parse_mode="HTML", reply_markup=profile_keyboard())
 
 async def user_stats_view(update, context):
     user = update.effective_user
@@ -454,7 +460,7 @@ async def ui_callback(update, context):
                 f"🔗 <b>Username:</b> {username_text}\n"
                 f"📅 <b>Joined:</b> {html.escape(format_dt(joined))}\n"
                 f"🟢 <b>Last active:</b> {html.escape(format_dt(last_seen))}")
-        await query.message.reply_text(text, parse_mode="HTML", reply_markup=user_features_keyboard())
+        await query.message.reply_text(text, parse_mode="HTML", reply_markup=profile_keyboard())
     elif query.data == "user_stats":
         messages, scans, generated, downloads = get_user_stats(user.id)
         log_activity(user.id, "view_stats")

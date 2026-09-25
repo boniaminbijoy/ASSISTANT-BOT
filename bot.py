@@ -31,7 +31,7 @@ from tiktok_downloader import (
 # BOT TOKEN
 # ==================================================
 
-BOT_TOKEN = os.environ.get("8645536260:AAH1p9zV8AHfOtZ26l8_oUYjuVwCtIOayH8")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN is missing. Add BOT_TOKEN in Render Environment Variables.")

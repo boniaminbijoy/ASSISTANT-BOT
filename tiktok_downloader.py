@@ -11,8 +11,8 @@ TIKTOK_USER_AGENT = os.environ.get(
 )
 
 # TikTok has recently had TLS/browser-fingerprint related breakages.
-# chrome-140 is intentionally used instead of always selecting the newest
-# browser target.
+# chrome-131 is used because it is a broadly available curl-cffi target
+# and avoids newer TikTok fingerprint regressions.
 TIKTOK_IMPERSONATE = os.environ.get("TIKTOK_IMPERSONATE", "chrome-131")
 TIKTOK_COOKIES_FILE = os.environ.get("TIKTOK_COOKIES_FILE")
 

@@ -3,5 +3,8 @@ Pillow
 opencv-python-headless
 qrcode
 pyzbar
+# Nightly is recommended by yt-dlp for site breakages; curl-cffi 0.16.0
+# avoids the recent TikTok impersonation regression seen with newer builds.
+--pre
 yt-dlp[default,curl-cffi]
-curl-cffi>=0.16,<0.17
+curl-cffi==0.16.0

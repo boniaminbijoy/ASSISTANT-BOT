@@ -691,7 +691,9 @@ async def handle_tiktok_link(
         elif error_text:
             user_error = error_text[:700]
         else:
-            user_error = "Unknown yt-dlp error."
+            user_error = (
+                f"{type(e).__name__}: {repr(e)}"
+            )
 
         await checking_message.edit_text(
             "❌ **Could not process this TikTok link.**\n\n"

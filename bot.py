@@ -117,6 +117,11 @@ def init_database():
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, error_type TEXT,
             error_text TEXT, created_at TEXT NOT NULL
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS support_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+            message TEXT NOT NULL, created_at TEXT NOT NULL, delivered INTEGER DEFAULT 0
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_support_messages_created ON support_messages(id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_download_history_user ON download_history(user_id, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_qr_scan_history_user ON qr_scan_history(user_id, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_qr_generate_history_user ON qr_generate_history(user_id, id DESC)")
@@ -295,6 +300,7 @@ def admin_keyboard():
         [InlineKeyboardButton("🔍 Search User", callback_data="admin_search"), InlineKeyboardButton("📈 Reports", callback_data="admin_reports")],
         [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"), InlineKeyboardButton("🔧 Maintenance", callback_data="admin_maintenance")],
         [InlineKeyboardButton("📣 Announcement", callback_data="admin_announce"), InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings")],
+        [InlineKeyboardButton("🧪 System Status", callback_data="admin_status")],
         [InlineKeyboardButton("🏠 Home", callback_data="ui_home")],
     ])
 
@@ -467,8 +473,50 @@ async def helpadmin_command(update, context):
         "/activeusers — Active Users (24h)\n/newuser — New Users (today)\n/topuser — Top Users\n/usercount — Total Users\n"
         "/users — Recent Users\n/searchuser <id|username> — Search User\n/user <id> — User Details\n"
         "/block <id> — Block User\n/unblock <id> — Unblock User\n/ban <id> — Ban User\n/unban <id> — Unban User\n"
-        "/broadcast — Text Broadcast\n/reports — Broadcast Reports\n/maintenance on|off — Maintenance\n/announce <msg> — Announcement\n/restart — Restart Bot\n/ping — Bot Ping",
+        "/broadcast — Text Broadcast\n/reports — Broadcast Reports\n/maintenance on|off — Maintenance\n/announce <msg> — Announcement\n/restart — Restart Bot\n/ping — Bot Ping\n/status — Live Command & Feature Status",
         parse_mode="Markdown", reply_markup=admin_keyboard())
+
+async def status_command(update, context):
+    """Admin-only live registry/status page for commands and button features."""
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text('⛔ Admin only.')
+        return
+
+    commands = [
+        ('/start', 'Main Menu'), ('/help', 'Help'), ('/profile', 'My Profile'),
+        ('/mystats', 'My Statistics'), ('/history', 'My History'), ('/settings', 'Language Settings'),
+        ('/support', 'User → Admin Support'), ('/about', 'About'), ('/id', 'User ID'),
+        ('/admin', 'Admin Panel'), ('/stats', 'Dashboard'), ('/users', 'User List'),
+        ('/user', 'User Details'), ('/searchuser', 'User Search'), ('/block /unblock', 'Block Control'),
+        ('/broadcast', 'Broadcast'), ('/reports', 'Broadcast Reports'), ('/schedule', 'Scheduled Broadcast'),
+        ('/scheduled /cancelschedule', 'Schedule Control'), ('/reply', 'Admin → User Reply'),
+        ('/maintenance', 'Maintenance'), ('/announce', 'Announcement'), ('/ping', 'Ping'),
+        ('/restart', 'Restart'), ('/adminlist', 'Admin List'), ('/addadmin /deladmin', 'Admin Management'),
+        ('/activeusers /newuser /topuser /usercount', 'User Statistics'),
+    ]
+    features = [
+        ('📥 Downloader', feature_enabled('downloader')),
+        ('📷 QR Scanner', feature_enabled('qr_scanner')),
+        ('🔲 QR Generator', feature_enabled('qr_generator')),
+        ('🆘 User Support', True),
+        ('📢 Broadcast', True),
+        ('⏰ Scheduled Broadcast', True),
+        ('🚨 Error Monitoring', True),
+        ('🛡️ Admin Commands', True),
+        ('⚙️ Feature Settings', True),
+        ('🔧 Maintenance', not maintenance_enabled()),
+    ]
+    lines=['🧪 <b>BOT SYSTEM STATUS</b>\n', '<b>Commands</b>']
+    for cmd, desc in commands:
+        lines.append(f'🟢 <code>{html.escape(cmd)}</code> — {html.escape(desc)}')
+    lines.append('\n<b>Buttons / Features</b>')
+    for name, enabled in features:
+        state = '🟢 ON' if enabled else '🔴 OFF'
+        if name == '🔧 Maintenance':
+            state = '🟢 OFF' if enabled else '🔴 ON'
+        lines.append(f'{state} — {html.escape(name)}')
+    lines.append('\nℹ️ This page shows registered commands and current feature switches. A command marked 🟢 is registered in the bot.')
+    await update.effective_message.reply_text('\n'.join(lines), parse_mode='HTML', reply_markup=admin_keyboard())
 
 async def ping_command(update, context):
     if not is_admin(update.effective_user.id):
@@ -683,30 +731,113 @@ async def cancel_schedule_command(update, context):
         for job in context.job_queue.get_jobs_by_name(f'scheduled_{sid}'): job.schedule_removal()
     await update.effective_message.reply_text(f'✅ Scheduled broadcast #{sid} cancelled.')
 
+async def status_callback(update, context):
+    q=update.callback_query
+    if not is_admin(q.from_user.id):
+        await q.answer('⛔ Admin only.', show_alert=True)
+        return
+    await q.answer()
+    # Reuse the same status content by generating it directly for callback context.
+    commands = [
+        ('/start', 'Main Menu'), ('/help', 'Help'), ('/profile', 'My Profile'), ('/mystats', 'My Statistics'),
+        ('/history', 'My History'), ('/settings', 'Language Settings'), ('/support', 'User → Admin Support'),
+        ('/admin', 'Admin Panel'), ('/stats', 'Dashboard'), ('/users', 'User List'), ('/user', 'User Details'),
+        ('/searchuser', 'User Search'), ('/broadcast', 'Broadcast'), ('/reports', 'Reports'),
+        ('/schedule /scheduled /cancelschedule', 'Scheduled Broadcast'), ('/reply', 'Admin Reply'),
+        ('/maintenance', 'Maintenance'), ('/announce', 'Announcement'), ('/ping', 'Ping'), ('/restart', 'Restart'),
+        ('/adminlist /addadmin /deladmin', 'Admin Management'), ('/activeusers /newuser /topuser /usercount', 'User Stats'),
+    ]
+    features = [
+        ('📥 Downloader', feature_enabled('downloader')), ('📷 QR Scanner', feature_enabled('qr_scanner')),
+        ('🔲 QR Generator', feature_enabled('qr_generator')), ('🆘 User Support', True),
+        ('📢 Broadcast', True), ('⏰ Scheduled Broadcast', True), ('🚨 Error Monitoring', True),
+        ('🛡️ Admin Commands', True), ('⚙️ Feature Settings', True),
+    ]
+    lines=['🧪 <b>BOT SYSTEM STATUS</b>\n', '<b>Commands</b>']
+    lines += [f'🟢 <code>{html.escape(c)}</code> — {html.escape(d)}' for c,d in commands]
+    lines.append('\n<b>Buttons / Features</b>')
+    lines += [f"{'🟢 ON' if e else '🔴 OFF'} — {html.escape(n)}" for n,e in features]
+    lines.append(f"\n🔧 Maintenance: <b>{'ON' if maintenance_enabled() else 'OFF'}</b>")
+    await q.edit_message_text('\n'.join(lines), parse_mode='HTML', reply_markup=admin_keyboard())
+
 async def settings_admin_callback(update, context):
     q=update.callback_query
     lines=['⚙️ *BOT SETTINGS*\n',f"🔧 Maintenance: *{'ON' if maintenance_enabled() else 'OFF'}*",f"🎵 Downloader: *{'ON' if feature_enabled('downloader') else 'OFF'}*",f"📷 QR Scanner: *{'ON' if feature_enabled('qr_scanner') else 'OFF'}*",f"🔲 QR Generator: *{'ON' if feature_enabled('qr_generator') else 'OFF'}*"]
-    kb=InlineKeyboardMarkup([[InlineKeyboardButton('🔧 Maintenance ON/OFF',callback_data='set_maintenance_toggle')],[InlineKeyboardButton('🎵 Downloader ON/OFF',callback_data='set_downloader_toggle')],[InlineKeyboardButton('📷 Scanner ON/OFF',callback_data='set_scanner_toggle')],[InlineKeyboardButton('🔲 Generator ON/OFF',callback_data='set_generator_toggle')],[InlineKeyboardButton('🏠 Admin Panel',callback_data='admin_panel_home')]])
+    kb=InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🔧 Maintenance: {'ON' if maintenance_enabled() else 'OFF'}",callback_data='set_maintenance_toggle')],
+        [InlineKeyboardButton(f"🎵 Downloader: {'ON' if feature_enabled('downloader') else 'OFF'}",callback_data='set_downloader_toggle')],
+        [InlineKeyboardButton(f"📷 Scanner: {'ON' if feature_enabled('qr_scanner') else 'OFF'}",callback_data='set_scanner_toggle')],
+        [InlineKeyboardButton(f"🔲 Generator: {'ON' if feature_enabled('qr_generator') else 'OFF'}",callback_data='set_generator_toggle')],
+        [InlineKeyboardButton('🏠 Admin Panel',callback_data='admin_panel_home')]
+    ])
     await q.edit_message_text('\n'.join(lines),parse_mode='Markdown',reply_markup=kb)
 
 async def support_start(update, context):
-    reset_modes(context); context.user_data['support_mode']=True
-    await update.effective_message.reply_text('🆘 *Support*\n\nআপনার সমস্যা লিখে পাঠান। আপনার message Admin-এর কাছে পাঠানো হবে।\n\nCancel করতে /start দিন.',parse_mode='Markdown')
+    reset_modes(context)
+    context.user_data['support_mode']=True
+    user = update.effective_user
+    lang = get_user_language(user.id) if user else 'en'
+    if lang == 'bn':
+        text = ('🆘 *সাপোর্ট*\n\nআপনার সমস্যাটি লিখে পাঠান। আপনার মেসেজটি অ্যাডমিনদের কাছে পাঠানো হবে।\n\n'
+                'বাতিল করতে /start দিন।')
+    else:
+        text = ('🆘 *Support*\n\nPlease type your problem and send it. Your message will be sent to the admin.\n\n'
+                'To cancel, send /start.')
+    await update.effective_message.reply_text(text, parse_mode='Markdown')
 
 async def support_message(update, context):
-    if not context.user_data.get('support_mode'): return False
-    user=update.effective_user; text=update.message.text or ''
-    if not text.strip(): return True
+    if not context.user_data.get('support_mode'):
+        return False
+    user=update.effective_user
+    text=(update.message.text or '').strip() if update.message else ''
+    if not text:
+        return True
     context.user_data['support_mode']=False
+
+    # Keep a local support inbox record even if an admin chat cannot receive the message.
     with db_connect() as conn:
-        admins=[r[0] for r in conn.execute('SELECT user_id FROM admins').fetchall()]
+        cur = conn.execute(
+            'INSERT INTO support_messages(user_id,message,created_at,delivered) VALUES(?,?,?,0)',
+            (user.id, text[:4000], utc_now())
+        )
+        support_id = cur.lastrowid
+        admin_rows = [r[0] for r in conn.execute('SELECT user_id FROM admins').fetchall()]
+        conn.commit()
+
+    # Include ADMIN_IDS directly as a safety net in case the database was created before an admin was added.
+    admin_ids = set(admin_rows) | set(ADMIN_IDS)
     sent=0
-    for aid in admins:
+    failed=[]
+    for aid in sorted(admin_ids):
         try:
-            await context.bot.send_message(aid, f'🆘 *NEW SUPPORT MESSAGE*\n\n👤 {html.escape(user.first_name or "User")}\n🆔 `{user.id}`\n🔗 @{html.escape(user.username or "—")}\n\n💬 {html.escape(text)}\n\nReply: /reply {user.id} <message>',parse_mode='HTML')
-            sent+=1
-        except Exception: pass
-    await update.message.reply_text('✅ আপনার message Admin-এর কাছে পাঠানো হয়েছে।')
+            await context.bot.send_message(
+                aid,
+                f'🆘 <b>NEW SUPPORT MESSAGE #{support_id}</b>\n\n'
+                f'👤 {html.escape(user.first_name or "User")}\n'
+                f'🆔 <code>{user.id}</code>\n'
+                f'🔗 @{html.escape(user.username or "—")}\n\n'
+                f'💬 {html.escape(text)}\n\n'
+                f'<b>Reply:</b> /reply {user.id} &lt;message&gt;',
+                parse_mode='HTML'
+            )
+            sent += 1
+        except Exception as exc:
+            failed.append((aid, repr(exc)))
+
+    with db_connect() as conn:
+        conn.execute('UPDATE support_messages SET delivered=? WHERE id=?', (1 if sent else 0, support_id))
+        conn.commit()
+
+    lang = get_user_language(user.id)
+    if sent:
+        msg = ('✅ আপনার মেসেজ অ্যাডমিনের কাছে পাঠানো হয়েছে।' if lang == 'bn'
+               else '✅ Your message has been sent to the admin.')
+    else:
+        msg = ('⚠️ এই মুহূর্তে কোনো অ্যাডমিনের কাছে মেসেজ পৌঁছানো যায়নি।\n\n'
+               'অ্যাডমিনকে অবশ্যই আগে এই বট-এ /start দিতে হবে।' if lang == 'bn' else
+               '⚠️ The message could not be delivered to any admin right now.\n\n'
+               'An admin must start the bot with /start first.')
+    await update.message.reply_text(msg)
     return True
 
 async def reply_user_command(update, context):
@@ -754,6 +885,7 @@ async def admin_callback(update, context):
     elif d=='admin_maintenance': await query.edit_message_text(f"🔧 *MAINTENANCE*\n\nCurrent: *{'ON' if maintenance_enabled() else 'OFF'}*\n\n/maintenance on\n/maintenance off",parse_mode='Markdown',reply_markup=admin_keyboard())
     elif d=='admin_announce': await query.edit_message_text('📣 *ADMIN ANNOUNCEMENT*\n\n/announce <message>',parse_mode='Markdown',reply_markup=admin_keyboard())
     elif d=='admin_settings': await settings_admin_callback(update, context)
+    elif d=='admin_status': await status_callback(update, context)
     elif d=='admin_panel_home': await query.edit_message_text('🛠️ *ADVANCED ADMIN PANEL*\n\nChoose an option:',parse_mode='Markdown',reply_markup=admin_keyboard())
     elif d in {'set_maintenance_toggle','set_downloader_toggle','set_scanner_toggle','set_generator_toggle'}:
         keymap={'set_maintenance_toggle':'maintenance','set_downloader_toggle':'downloader','set_scanner_toggle':'qr_scanner','set_generator_toggle':'qr_generator'}
@@ -1042,7 +1174,7 @@ ADMIN_HELP_PAGES = {
         "/announce &lt;message&gt; — Send admin announcement\n"
         "/reports — View recent broadcast reports\n\n"
         "🔧 <b>Bot Control</b>\n"
-        "/maintenance on|off — Enable/disable maintenance mode\n"
+        "/maintenance on|off — Enable/disable maintenance mode\n/status — Live command & button feature status\n"
         "/restart — Restart the Render service process\n"
         "/ping — Check bot response time\n"
     ),
@@ -2132,6 +2264,7 @@ def main():
     app.add_handler(CommandHandler("topuser", topuser_command))
     app.add_handler(CommandHandler("usercount", usercount_command))
     app.add_handler(CommandHandler("ping", ping_command))
+    app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("restart", restart_command))
     app.add_handler(CommandHandler("about", about_command))
     app.add_handler(CommandHandler("support", support_command))
@@ -2202,7 +2335,7 @@ def main():
         await application.bot.set_my_commands([
             ("start", "Open main menu"), ("help", "Help"), ("profile", "My Profile"),
             ("mystats", "My Statistics"), ("history", "My History"), ("settings", "Settings"),
-            ("support", "Contact Admin")
+            ("support", "Contact Admin"), ("status", "Admin system status")
         ])
         if application.job_queue:
             # Restore pending schedules after a Render restart.

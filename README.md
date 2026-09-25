@@ -1,49 +1,30 @@
-# ASSISTANT BOT — Phase 3 Professional
+# Assistant Bot V25
 
-Features:
-- TikTok downloader
-- QR scanner
-- QR generator
-- SQLite user database and usage statistics
-- Admin panel (`/admin`)
-- `/stats` command
-- `/broadcast Your message` broadcast
+V25 fixes and upgrades based on V24.
 
-## Render Admin Setup
-Add environment variable `ADMIN_IDS` with your Telegram numeric user ID. Example: `123456789`.
+## Bug fixes
+- `/support` now sends to admins from both the database `admins` table and `ADMIN_IDS` as a safety net.
+- Support messages are stored in a local `support_messages` inbox table with delivery status.
+- `/support` instruction follows the user's saved language (English/Bangla).
+- If no admin can receive the message, the user gets a clear notice that an admin must first open the bot with `/start`.
 
-The user database is stored in `bot_data.db`. For persistent storage across Render restarts, use a persistent disk or migrate the database to PostgreSQL in a later production-hardening step.
+## New admin tools
+- `/status` — admin-only live registry of available commands and current button/feature states.
+- `🧪 System Status` button in the Admin Panel.
+- Feature Settings now use direct ON/OFF buttons and show the current state on each button.
+- Existing V24 admin-only `🛡️ Admin Commands` button is preserved.
 
-## Admin commands
-- `/admin` — admin panel
-- `/stats` — statistics
-- `/broadcast Your message` — broadcast to registered users
+## Existing features preserved
+- TikTok Downloader
+- QR Scanner / Generator
+- User Profile / Statistics / History
+- Advanced Admin Panel
+- Scheduled Broadcast
+- User → Admin Support + `/reply`
+- Error Monitoring
+- Maintenance mode
+- Feature toggles
+- Automatic Telegram command menu setup
 
-
-## V14 additions
-- `/myid` (and `/id`) shows your Telegram numeric User ID for configuring `ADMIN_IDS`.
-- Unauthorized `/admin` now also shows your current Telegram ID to make admin setup easier.
-- `ADMIN_IDS` accepts comma-separated numeric IDs (semicolon separators are also accepted).
-
-
-## V16 Professional UI
-- Redesigned /start main menu
-- Inline downloader selection
-- Settings menu
-- Persistent Bengali/English language preference
-- Personal statistics menu
-- Help menu
-- Home/back-to-home navigation
-- Legacy button labels remain supported
-
-
-## V16 – User Features
-- 👤 My Profile
-- 📊 My Statistics
-- 📥 Download History (latest 10)
-- 📷 QR Scan History (latest 10)
-- 🔲 QR Generate History (latest 10)
-- 🕘 User activity tracking
-- Commands: `/profile`, `/mystats`, `/history`
-
-New SQLite tables are created automatically on startup; existing user/admin data is preserved.
+## Deployment
+Deploy this ZIP to Render as the replacement for V24, then redeploy/restart the service.

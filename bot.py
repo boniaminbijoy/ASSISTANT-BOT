@@ -4,8 +4,10 @@ import html
 import tempfile
 import uuid
 import sqlite3
+import traceback
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
 
@@ -47,6 +49,11 @@ if not BOT_TOKEN:
 DB_PATH = os.environ.get("BOT_DB_PATH", "bot_data.db")
 ADMIN_IDS = {int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").replace(";", ",").split(",") if x.strip().isdigit()}
 
+# Increment this when the user-facing reply-keyboard menu logic changes.
+# Existing users will automatically receive the new menu on their next interaction;
+# they do not need to press /start.
+MENU_VERSION = "23"
+
 
 async def myid_command(update, context):
     """Show the Telegram numeric user ID needed for ADMIN_IDS."""
@@ -76,6 +83,8 @@ def init_database():
         cols = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
         if "language" not in cols:
             conn.execute("ALTER TABLE users ADD COLUMN language TEXT DEFAULT 'en'")
+        if "menu_version" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN menu_version TEXT DEFAULT ''")
         conn.execute("""CREATE TABLE IF NOT EXISTS download_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
             platform TEXT NOT NULL, url TEXT NOT NULL, quality TEXT DEFAULT '',
@@ -105,6 +114,15 @@ def init_database():
             id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER NOT NULL,
             kind TEXT NOT NULL, target_count INTEGER DEFAULT 0, sent INTEGER DEFAULT 0,
             failed INTEGER DEFAULT 0, blocked INTEGER DEFAULT 0, created_at TEXT NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS scheduled_broadcasts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER NOT NULL,
+            message TEXT NOT NULL, run_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'scheduled',
+            created_at TEXT NOT NULL, sent INTEGER DEFAULT 0, failed INTEGER DEFAULT 0, blocked INTEGER DEFAULT 0
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS error_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, error_type TEXT,
+            error_text TEXT, created_at TEXT NOT NULL
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_download_history_user ON download_history(user_id, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_qr_scan_history_user ON qr_scan_history(user_id, id DESC)")
@@ -242,6 +260,27 @@ def set_maintenance(enabled):
         conn.execute("INSERT INTO bot_settings(key,value) VALUES('maintenance',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", ('1' if enabled else '0',))
         conn.commit()
 
+def get_setting(key, default='1'):
+    with db_connect() as conn:
+        row=conn.execute("SELECT value FROM bot_settings WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
+
+def set_setting(key, value):
+    with db_connect() as conn:
+        conn.execute("INSERT INTO bot_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+        conn.commit()
+
+def feature_enabled(key):
+    return get_setting(key, '1') == '1'
+
+def save_error(user_id, error_type, error_text):
+    try:
+        with db_connect() as conn:
+            conn.execute("INSERT INTO error_logs(user_id,error_type,error_text,created_at) VALUES(?,?,?,?)", (user_id, error_type, str(error_text)[:4000], utc_now()))
+            conn.commit()
+    except Exception:
+        pass
+
 def save_broadcast_report(admin_id, kind, target, sent, failed, blocked):
     with db_connect() as conn:
         conn.execute("INSERT INTO broadcast_reports(admin_id,kind,target_count,sent,failed,blocked,created_at) VALUES(?,?,?,?,?,?,?)", (admin_id,kind,target,sent,failed,blocked,utc_now()))
@@ -262,7 +301,8 @@ def admin_keyboard():
         [InlineKeyboardButton("📊 Dashboard", callback_data="admin_dashboard"), InlineKeyboardButton("👥 Users", callback_data="admin_users")],
         [InlineKeyboardButton("🔍 Search User", callback_data="admin_search"), InlineKeyboardButton("📈 Reports", callback_data="admin_reports")],
         [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"), InlineKeyboardButton("🔧 Maintenance", callback_data="admin_maintenance")],
-        [InlineKeyboardButton("📣 Announcement", callback_data="admin_announce"), InlineKeyboardButton("🏠 Home", callback_data="ui_home")],
+        [InlineKeyboardButton("📣 Announcement", callback_data="admin_announce"), InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings")],
+        [InlineKeyboardButton("🏠 Home", callback_data="ui_home")],
     ])
 
 async def admin_panel(update, context):
@@ -274,11 +314,16 @@ async def admin_panel(update, context):
 async def dashboard_text():
     total, active24, messages, scans, generated, downloads=get_stats()
     d=get_period_stats(1); w=get_period_stats(7); m=get_period_stats(30)
-    return (f"📊 *ADMIN DASHBOARD*\n\n👥 Total Users: *{total}*\n🟢 Active 24h: *{active24}*\n\n"
+    with db_connect() as conn:
+        scheduled=conn.execute("SELECT COUNT(*) FROM scheduled_broadcasts WHERE status='scheduled'").fetchone()[0]
+        errors=conn.execute("SELECT COUNT(*) FROM error_logs WHERE created_at >= ?", ((datetime.now(timezone.utc)-timedelta(days=1)).isoformat(timespec='seconds'),)).fetchone()[0]
+        broadcasts=conn.execute("SELECT COUNT(*) FROM broadcast_reports").fetchone()[0]
+    return (f"📊 *ADVANCED ADMIN DASHBOARD*\n\n"
+            f"👥 Total Users: *{total}*\n🟢 Active 24h: *{active24}*\n💬 Messages: *{messages}*\n\n"
             f"📅 *Daily* — Users {d[0]} | DL {d[4]} | QR Scan {d[2]} | QR Gen {d[3]}\n"
             f"📅 *Weekly* — Users {w[0]} | DL {w[4]} | QR Scan {w[2]} | QR Gen {w[3]}\n"
             f"📅 *Monthly* — Users {m[0]} | DL {m[4]} | QR Scan {m[2]} | QR Gen {m[3]}\n\n"
-            f"💬 Messages: *{messages}*\n🎵 Downloads: *{downloads}*\n📷 QR Scans: *{scans}*\n🔲 QR Generated: *{generated}*\n🔧 Maintenance: *{'ON' if maintenance_enabled() else 'OFF'}*")
+            f"🎵 Total Downloads: *{downloads}*\n📷 Total QR Scans: *{scans}*\n🔲 Total QR Generated: *{generated}*\n📢 Broadcasts: *{broadcasts}*\n⏰ Scheduled: *{scheduled}*\n🚨 Errors (24h): *{errors}*\n🔧 Maintenance: *{'ON' if maintenance_enabled() else 'OFF'}*")
 
 async def stats_command(update, context):
     if not is_admin(update.effective_user.id):
@@ -412,9 +457,7 @@ async def about_command(update, context):
         parse_mode="Markdown")
 
 async def support_command(update, context):
-    await update.effective_message.reply_text(
-        "🆘 *SUPPORT*\n\nIf you need help, contact the bot administrator.\n\nUse /myid to see your Telegram ID if the administrator asks for it.",
-        parse_mode="Markdown")
+    await support_start(update, context)
 
 async def helpuser_command(update, context):
     await update.effective_message.reply_text(
@@ -572,6 +615,129 @@ async def broadcast_button_command(update, context):
     save_broadcast_report(update.effective_user.id,'button',len(users),sent,failed,blocked)
     await update.effective_message.reply_text(f"✅ Button broadcast report\n\nTarget: {len(users)}\nSent: {sent}\nFailed: {failed}\nBlocked: {blocked}")
 
+async def send_broadcast_to_users(bot, text, admin_id, kind='scheduled'):
+    with db_connect() as conn:
+        users=[r[0] for r in conn.execute("SELECT user_id FROM users WHERE is_blocked=0").fetchall()]
+    sent=failed=blocked=0
+    for uid in users:
+        try:
+            await bot.send_message(uid, text)
+            sent += 1
+        except Exception as exc:
+            failed += 1
+            if 'blocked' in str(exc).lower() or 'chat not found' in str(exc).lower(): blocked += 1
+    save_broadcast_report(admin_id, kind, len(users), sent, failed, blocked)
+    return len(users), sent, failed, blocked
+
+async def scheduled_broadcast_job(context):
+    job=context.job
+    data=job.data
+    try:
+        target,sent,failed,blocked=await send_broadcast_to_users(context.bot, data['message'], data['admin_id'], 'scheduled')
+        with db_connect() as conn:
+            conn.execute("UPDATE scheduled_broadcasts SET status='sent', sent=?, failed=?, blocked=? WHERE id=?", (sent,failed,blocked,data['id']))
+            conn.commit()
+        try:
+            await context.bot.send_message(data['admin_id'], f"⏰ Scheduled broadcast #{data['id']} completed.\n\n📨 Sent: {sent}\n⚠️ Failed: {failed}\n🚫 Blocked: {blocked}")
+        except Exception:
+            pass
+    except Exception as exc:
+        save_error(data.get('admin_id'), 'scheduled_broadcast', traceback.format_exc())
+        with db_connect() as conn:
+            conn.execute("UPDATE scheduled_broadcasts SET status='failed' WHERE id=?", (data['id'],))
+            conn.commit()
+
+async def schedule_command(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text('⛔ Admin only.'); return
+    arg=update.message.text.partition(' ')[2].strip()
+    if '|' not in arg:
+        await update.effective_message.reply_text('Usage: /schedule YYYY-MM-DD HH:MM | message\nTime zone: Asia/Dhaka'); return
+    when,text=[x.strip() for x in arg.split('|',1)]
+    try:
+        local_dt=datetime.strptime(when,'%Y-%m-%d %H:%M').replace(tzinfo=ZoneInfo('Asia/Dhaka'))
+        run_at=local_dt.astimezone(timezone.utc)
+        if run_at <= datetime.now(timezone.utc):
+            await update.effective_message.reply_text('❌ Time must be in the future.'); return
+    except Exception:
+        await update.effective_message.reply_text('❌ Invalid date/time. Example: /schedule 2026-09-30 20:00 | Hello users'); return
+    with db_connect() as conn:
+        cur=conn.execute("INSERT INTO scheduled_broadcasts(admin_id,message,run_at,status,created_at) VALUES(?,?,?,?,?)", (update.effective_user.id,text,run_at.isoformat(timespec='seconds'),'scheduled',utc_now()))
+        sid=cur.lastrowid; conn.commit()
+    if context.job_queue:
+        context.job_queue.run_once(scheduled_broadcast_job, when=run_at, data={'id':sid,'admin_id':update.effective_user.id,'message':text}, name=f'scheduled_{sid}')
+    await update.effective_message.reply_text(f'⏰ Scheduled broadcast #{sid} created.\n🕘 {when} Asia/Dhaka')
+
+async def scheduled_list_command(update, context):
+    if not is_admin(update.effective_user.id): await update.effective_message.reply_text('⛔ Admin only.'); return
+    with db_connect() as conn:
+        rows=conn.execute("SELECT id,message,run_at,status FROM scheduled_broadcasts ORDER BY id DESC LIMIT 20").fetchall()
+    if not rows: await update.effective_message.reply_text('⏰ No scheduled broadcasts.'); return
+    lines=['⏰ *SCHEDULED BROADCASTS*\n']
+    for sid,msg,run,status in rows: lines.append(f'#{sid} — {status} — {format_dt(run)}\n{html.escape(msg[:120])}')
+    await update.effective_message.reply_text('\n\n'.join(lines),parse_mode='Markdown',reply_markup=admin_keyboard())
+
+async def cancel_schedule_command(update, context):
+    if not is_admin(update.effective_user.id): await update.effective_message.reply_text('⛔ Admin only.'); return
+    arg=update.message.text.partition(' ')[2].strip()
+    if not arg.isdigit(): await update.effective_message.reply_text('Usage: /cancelschedule <id>'); return
+    sid=int(arg)
+    with db_connect() as conn:
+        row=conn.execute("SELECT status FROM scheduled_broadcasts WHERE id=?",(sid,)).fetchone()
+        if not row: await update.effective_message.reply_text('❌ Schedule not found.'); return
+        conn.execute("UPDATE scheduled_broadcasts SET status='cancelled' WHERE id=?",(sid,)); conn.commit()
+    if context.job_queue:
+        for job in context.job_queue.get_jobs_by_name(f'scheduled_{sid}'): job.schedule_removal()
+    await update.effective_message.reply_text(f'✅ Scheduled broadcast #{sid} cancelled.')
+
+async def settings_admin_callback(update, context):
+    q=update.callback_query
+    lines=['⚙️ *BOT SETTINGS*\n',f"🔧 Maintenance: *{'ON' if maintenance_enabled() else 'OFF'}*",f"🎵 Downloader: *{'ON' if feature_enabled('downloader') else 'OFF'}*",f"📷 QR Scanner: *{'ON' if feature_enabled('qr_scanner') else 'OFF'}*",f"🔲 QR Generator: *{'ON' if feature_enabled('qr_generator') else 'OFF'}*"]
+    kb=InlineKeyboardMarkup([[InlineKeyboardButton('🔧 Maintenance ON/OFF',callback_data='set_maintenance_toggle')],[InlineKeyboardButton('🎵 Downloader ON/OFF',callback_data='set_downloader_toggle')],[InlineKeyboardButton('📷 Scanner ON/OFF',callback_data='set_scanner_toggle')],[InlineKeyboardButton('🔲 Generator ON/OFF',callback_data='set_generator_toggle')],[InlineKeyboardButton('🏠 Admin Panel',callback_data='admin_panel_home')]])
+    await q.edit_message_text('\n'.join(lines),parse_mode='Markdown',reply_markup=kb)
+
+async def support_start(update, context):
+    reset_modes(context); context.user_data['support_mode']=True
+    await update.effective_message.reply_text('🆘 *Support*\n\nআপনার সমস্যা লিখে পাঠান। আপনার message Admin-এর কাছে পাঠানো হবে।\n\nCancel করতে /start দিন.',parse_mode='Markdown')
+
+async def support_message(update, context):
+    if not context.user_data.get('support_mode'): return False
+    user=update.effective_user; text=update.message.text or ''
+    if not text.strip(): return True
+    context.user_data['support_mode']=False
+    with db_connect() as conn:
+        admins=[r[0] for r in conn.execute('SELECT user_id FROM admins').fetchall()]
+    sent=0
+    for aid in admins:
+        try:
+            await context.bot.send_message(aid, f'🆘 *NEW SUPPORT MESSAGE*\n\n👤 {html.escape(user.first_name or "User")}\n🆔 `{user.id}`\n🔗 @{html.escape(user.username or "—")}\n\n💬 {html.escape(text)}\n\nReply: /reply {user.id} <message>',parse_mode='HTML')
+            sent+=1
+        except Exception: pass
+    await update.message.reply_text('✅ আপনার message Admin-এর কাছে পাঠানো হয়েছে।')
+    return True
+
+async def reply_user_command(update, context):
+    if not is_admin(update.effective_user.id): await update.effective_message.reply_text('⛔ Admin only.'); return
+    parts=update.message.text.partition(' ')[2].strip().split(' ',1)
+    if len(parts)<2 or not parts[0].isdigit(): await update.effective_message.reply_text('Usage: /reply <user_id> <message>'); return
+    uid=int(parts[0]); text=parts[1]
+    try:
+        await context.bot.send_message(uid,f'📩 *Admin Reply*\n\n{text}',parse_mode='Markdown')
+        await update.effective_message.reply_text('✅ Reply sent.')
+    except Exception as exc:
+        await update.effective_message.reply_text(f'❌ Failed: {str(exc)[:300]}')
+
+async def error_monitor(update, context):
+    err=context.error
+    uid=getattr(getattr(update,'effective_user',None),'id',None) if update else None
+    save_error(uid, type(err).__name__, traceback.format_exc())
+    with db_connect() as conn:
+        admins=[r[0] for r in conn.execute('SELECT user_id FROM admins').fetchall()]
+    snippet=str(err)[:700]
+    for aid in admins:
+        try: await context.bot.send_message(aid, f'🚨 *BOT ERROR*\n\nType: `{type(err).__name__}`\nUser: `{uid or "N/A"}`\n\n`{snippet}`',parse_mode='Markdown')
+        except Exception: pass
+
 async def reports_command(update, context):
     if not is_admin(update.effective_user.id): await update.effective_message.reply_text("⛔ Admin only."); return
     with db_connect() as conn: rows=conn.execute("SELECT kind,target_count,sent,failed,blocked,created_at FROM broadcast_reports ORDER BY id DESC LIMIT 10").fetchall()
@@ -594,6 +760,14 @@ async def admin_callback(update, context):
     elif d=='admin_broadcast': await query.edit_message_text('📢 *BROADCAST*\n\n/broadcast <text>\n/broadcast_media — reply to photo/video/document\n/broadcast_button Button Text | https://example.com',parse_mode='Markdown',reply_markup=admin_keyboard())
     elif d=='admin_maintenance': await query.edit_message_text(f"🔧 *MAINTENANCE*\n\nCurrent: *{'ON' if maintenance_enabled() else 'OFF'}*\n\n/maintenance on\n/maintenance off",parse_mode='Markdown',reply_markup=admin_keyboard())
     elif d=='admin_announce': await query.edit_message_text('📣 *ADMIN ANNOUNCEMENT*\n\n/announce <message>',parse_mode='Markdown',reply_markup=admin_keyboard())
+    elif d=='admin_settings': await settings_admin_callback(update, context)
+    elif d=='admin_panel_home': await query.edit_message_text('🛠️ *ADVANCED ADMIN PANEL*\n\nChoose an option:',parse_mode='Markdown',reply_markup=admin_keyboard())
+    elif d in {'set_maintenance_toggle','set_downloader_toggle','set_scanner_toggle','set_generator_toggle'}:
+        keymap={'set_maintenance_toggle':'maintenance','set_downloader_toggle':'downloader','set_scanner_toggle':'qr_scanner','set_generator_toggle':'qr_generator'}
+        key=keymap[d]
+        if key=='maintenance': set_maintenance(not maintenance_enabled())
+        else: set_setting(key,'0' if feature_enabled(key) else '1')
+        await settings_admin_callback(update, context)
 
 async def maintenance_guard(update, context):
     """Hard gate: blocked users and maintenance-mode users must not reach any later handler group."""
@@ -622,9 +796,52 @@ async def maintenance_guard(update, context):
             await update.callback_query.answer("🔧 Bot maintenance mode is ON.", show_alert=True)
         raise ApplicationHandlerStop
 
+async def ensure_latest_menu(update, context):
+    """Automatically migrate a user's reply keyboard to the current menu version.
+
+    Telegram reply keyboards cannot be edited in-place after they were sent.
+    Instead, the bot sends the new keyboard once when it detects that the user's
+    stored menu version is older than MENU_VERSION. This happens on the user's
+    next interaction, so /start is no longer required after a deployment.
+    """
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+
+    # Only private chats should receive the personal main menu.
+    if getattr(msg.chat, "type", None) != "private":
+        return
+
+    # Admins and normal users can both use the latest menu; blocked/maintenance
+    # users are stopped earlier by maintenance_guard (group -2).
+    try:
+        with db_connect() as conn:
+            row = conn.execute("SELECT menu_version, language FROM users WHERE user_id = ?", (user.id,)).fetchone()
+            current = row[0] if row else ""
+            language = row[1] if row and row[1] in {"bn", "en"} else "en"
+
+        if current == MENU_VERSION:
+            return
+
+        await msg.reply_text(
+            "🔄 <b>Menu Updated</b>\n\n"
+            "নতুন menu automatically চালু হয়েছে। /start চাপতে হবে না।" if language == "bn" else
+            "🔄 <b>Menu Updated</b>\n\nThe latest menu is now active automatically. You do not need to press /start.",
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(language),
+        )
+        with db_connect() as conn:
+            conn.execute("UPDATE users SET menu_version = ?, last_seen = ? WHERE user_id = ?", (MENU_VERSION, utc_now(), user.id))
+            conn.commit()
+    except Exception as exc:
+        print("Menu auto-update error:", repr(exc))
+
+
 async def track_update(update, context):
     if update.effective_user:
         register_user(update.effective_user, count_message=bool(update.effective_message))
+        await ensure_latest_menu(update, context)
         try:
             if update.callback_query:
                 action = "button_click"
@@ -754,16 +971,13 @@ async def user_features_command(update, context):
 # MAIN MENU
 # ==================================================
 
-def get_main_keyboard(language="en", is_admin_user=False):
+def get_main_keyboard(language="en"):
     keyboard = [
         ["📥 Downloader", "📷 QR Scanner"],
         ["🔲 QR Generator", "📊 My Stats"],
         ["👤 My Profile", "🕘 My History"],
         ["⚙️ Settings", "❓ Help"],
     ]
-    # Admin-only button: never show it to normal users.
-    if is_admin_user:
-        keyboard.append(["🛡️ Admin Commands"])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 def downloader_keyboard():
@@ -784,10 +998,9 @@ def help_keyboard():
 async def show_home(update, context):
     user = update.effective_user
     lang = get_user_language(user.id) if user else "en"
-    admin_user = bool(user and is_admin(user.id))
     reset_modes(context)
     text = ("🤖 *ASSISTANT BOT-এ স্বাগতম!* 🚀\n\nআপনার All-in-One Telegram Utility Bot।\n\n📥 Downloader\n📷 QR Scanner\n🔲 QR Generator\n📊 Personal Statistics\n⚙️ Settings\n❓ Help\n\nনিচের Menu থেকে একটি অপশন নির্বাচন করুন।") if lang == "bn" else ("🤖 *Welcome to ASSISTANT BOT!* 🚀\n\nYour All-in-One Telegram Utility Bot.\n\n📥 Downloader\n📷 QR Scanner\n🔲 QR Generator\n📊 Personal Statistics\n⚙️ Settings\n❓ Help\n\nChoose an option from the menu below.")
-    await update.effective_message.reply_text(text, reply_markup=get_main_keyboard(lang, admin_user), parse_mode="Markdown")
+    await update.effective_message.reply_text(text, reply_markup=get_main_keyboard(lang), parse_mode="Markdown")
 
 async def ui_callback(update, context):
     query = update.callback_query
@@ -831,98 +1044,6 @@ async def ui_callback(update, context):
         set_user_language(user.id, lang)
         await query.message.reply_text("✅ ভাষা বাংলা করা হয়েছে।" if lang == "bn" else "✅ Language changed to English.", reply_markup=get_main_keyboard(lang))
 
-def admin_help_keyboard(page=1):
-    buttons = []
-    if page > 1:
-        buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"admin_help_{page-1}"))
-    if page < 3:
-        buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"admin_help_{page+1}"))
-    rows = [buttons] if buttons else []
-    rows.append([InlineKeyboardButton("🛠️ Admin Panel", callback_data="admin_dashboard"),
-                 InlineKeyboardButton("🏠 Home", callback_data="ui_home")])
-    return InlineKeyboardMarkup(rows)
-
-ADMIN_HELP_PAGES = {
-    1: (
-        "🛡️ <b>ADMIN COMMANDS — 1/3</b>\n\n"
-        "📊 <b>Dashboard & Statistics</b>\n"
-        "/admin — Open Admin Panel\n"
-        "/stats — Dashboard/statistics overview\n"
-        "/users — Latest users list\n"
-        "/activeusers — Users active in last 24h\n"
-        "/newuser — New users today\n"
-        "/topuser — Most active users\n"
-        "/usercount — Total and blocked user count\n"
-        "/reports — Broadcast delivery reports\n\n"
-        "👥 <b>User Management</b>\n"
-        "/searchuser &lt;id|username&gt; — Search a user\n"
-        "/user &lt;id&gt; — View user details\n\n"
-        "🚫 <b>User Control</b>\n"
-        "/block &lt;id&gt; — Block a user\n"
-        "/unblock &lt;id&gt; — Remove block\n"
-        "/ban &lt;id&gt; — Ban (same block system)\n"
-        "/unban &lt;id&gt; — Remove ban\n"
-    ),
-    2: (
-        "🛡️ <b>ADMIN COMMANDS — 2/3</b>\n\n"
-        "👑 <b>Admin Management</b>\n"
-        "/adminlist — Show admin list\n"
-        "/addadmin &lt;id&gt; — Add an admin\n"
-        "/deladmin &lt;id&gt; — Remove a database admin\n\n"
-        "📢 <b>Broadcast</b>\n"
-        "/broadcast &lt;text&gt; — Text broadcast\n"
-        "/broadcast_media — Broadcast replied photo/video/document\n"
-        "/broadcast_button — Broadcast with URL button\n"
-        "/announce &lt;message&gt; — Send admin announcement\n"
-        "/reports — View recent broadcast reports\n\n"
-        "🔧 <b>Bot Control</b>\n"
-        "/maintenance on|off — Enable/disable maintenance mode\n"
-        "/restart — Restart the Render service process\n"
-        "/ping — Check bot response time\n"
-    ),
-    3: (
-        "🛡️ <b>ADMIN COMMANDS — 3/3</b>\n\n"
-        "ℹ️ <b>Information & Help</b>\n"
-        "/about — Bot information\n"
-        "/support — Support information\n"
-        "/helpuser — Show user commands\n"
-        "/helpadmin — Show admin command list\n"
-        "/id or /myid — Show your Telegram ID\n\n"
-        "📌 <b>Quick Examples</b>\n"
-        "/block 123456789\n"
-        "/unblock 123456789\n"
-        "/user 123456789\n"
-        "/searchuser 123456789\n"
-        "/addadmin 123456789\n"
-        "/maintenance on\n"
-        "/broadcast Hello everyone!\n"
-        "/announce Important notice\n\n"
-        "🔐 <b>Security:</b> These commands are available only to verified admins.\n"
-        "⚠️ Admin IDs configured in Render <code>ADMIN_IDS</code> cannot be removed with /deladmin."
-    ),
-}
-
-async def admin_help_button(update, context):
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        await update.effective_message.reply_text("⛔ Admin only.")
-        return True
-    await update.effective_message.reply_text(ADMIN_HELP_PAGES[1], parse_mode="HTML", reply_markup=admin_help_keyboard(1))
-    return True
-
-async def admin_help_callback(update, context):
-    query = update.callback_query
-    if not is_admin(query.from_user.id):
-        await query.answer("⛔ Admin only.", show_alert=True)
-        return
-    try:
-        page = int(query.data.rsplit("_", 1)[1])
-    except (ValueError, IndexError):
-        page = 1
-    page = max(1, min(3, page))
-    await query.answer()
-    await query.edit_message_text(ADMIN_HELP_PAGES[page], parse_mode="HTML", reply_markup=admin_help_keyboard(page))
-
 async def settings_command(update, context):
     await update.effective_message.reply_text("⚙️ *Settings*\n\nChoose your language:", reply_markup=settings_keyboard(), parse_mode="Markdown")
 
@@ -952,8 +1073,6 @@ async def ui_text_action(update, context, text):
         await settings_command(update, context); return True
     if text == "❓ Help":
         await help_command(update, context); return True
-    if text == "🛡️ Admin Commands":
-        return await admin_help_button(update, context)
     return False
 
 def make_progress_bar(percent: int, width: int = 10) -> str:
@@ -993,6 +1112,9 @@ async def qr_scanner_start(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
+    if not feature_enabled('qr_scanner') and not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text('📷 QR Scanner is temporarily disabled by Admin.')
+        return
     reset_modes(context)
 
     # Scanner ON
@@ -1126,6 +1248,9 @@ async def qr_generator_start(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
+    if not feature_enabled('qr_generator') and not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text('🔲 QR Generator is temporarily disabled by Admin.')
+        return
     reset_modes(context)
 
     # Generator ON
@@ -1319,6 +1444,9 @@ async def tiktok_downloader_start(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
+    if not feature_enabled('downloader') and not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text('🎵 Downloader is temporarily disabled by Admin.')
+        return
     reset_modes(context)
 
     # TikTok mode ON
@@ -1788,6 +1916,8 @@ async def handle_text(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
+    if await support_message(update, context):
+        return
     text = update.message.text.strip()
 
     if await ui_text_action(update, context, text):
@@ -1912,6 +2042,39 @@ async def handle_text(
 
 
 # ==================================================
+# APPLICATION STARTUP
+# ==================================================
+
+async def post_init(application):
+    """Run startup tasks through PTB's supported post_init lifecycle hook."""
+    await application.bot.set_my_commands([
+        ("start", "Open main menu"), ("help", "Help"), ("profile", "My Profile"),
+        ("mystats", "My Statistics"), ("history", "My History"), ("settings", "Settings"),
+        ("support", "Contact Admin")
+    ])
+    if application.job_queue:
+        # Restore pending schedules after a Render restart.
+        with db_connect() as conn:
+            rows = conn.execute(
+                "SELECT id,admin_id,message,run_at FROM scheduled_broadcasts WHERE status='scheduled'"
+            ).fetchall()
+        now = datetime.now(timezone.utc)
+        for sid, aid, msg, run in rows:
+            try:
+                when = datetime.fromisoformat(run)
+                if when <= now:
+                    when = now + timedelta(seconds=2)
+                application.job_queue.run_once(
+                    scheduled_broadcast_job,
+                    when=when,
+                    data={"id": sid, "admin_id": aid, "message": msg},
+                    name=f"scheduled_{sid}",
+                )
+            except Exception as exc:
+                save_error(aid, "schedule_restore", repr(exc))
+
+
+# ==================================================
 # MAIN
 # ==================================================
 
@@ -1923,6 +2086,7 @@ def main():
         Application
         .builder()
         .token(BOT_TOKEN)
+        .post_init(post_init)
         .build()
     )
 
@@ -1962,14 +2126,17 @@ def main():
     app.add_handler(CommandHandler("helpadmin", helpadmin_command))
     app.add_handler(CommandHandler("maintenance", maintenance_command))
     app.add_handler(CommandHandler("announce", announce_command))
+    app.add_handler(CommandHandler("schedule", schedule_command))
+    app.add_handler(CommandHandler("scheduled", scheduled_list_command))
+    app.add_handler(CommandHandler("cancelschedule", cancel_schedule_command))
+    app.add_handler(CommandHandler("reply", reply_user_command))
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("profile", user_profile_command))
     app.add_handler(CommandHandler("mystats", user_stats_view))
     app.add_handler(CommandHandler("history", user_features_command))
     app.add_handler(CallbackQueryHandler(ui_callback, pattern=r"^(ui_|lang_|user_profile$|user_stats$|hist_(downloads|scans|generates|activity)$)"))
-    app.add_handler(CallbackQueryHandler(admin_help_callback, pattern=r"^admin_help_[123]$"))
-    app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin_"))
+    app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^(admin_|set_)"))
 
     # ==========================================
     # /start
@@ -2015,6 +2182,7 @@ def main():
     # Render Web Service needs an open port.
     Thread(target=start_web_server, daemon=True).start()
 
+    app.add_error_handler(error_monitor)
     app.run_polling()
 
 

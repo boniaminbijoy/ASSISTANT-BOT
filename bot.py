@@ -13,7 +13,7 @@ from threading import Thread
 
 from telegram import (
     Update,
-    ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
+    ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 )
 
 from telegram.ext import (
@@ -321,16 +321,33 @@ def more_bots_keyboard():
     rows=get_more_bots(True)
     buttons=[]
     for bot_id, username, name, desc, enabled in rows:
-        buttons.append([InlineKeyboardButton(f"🤖 {name}", callback_data=f"morebot_view_{bot_id}")])
+        buttons.append([InlineKeyboardButton(f"🤖 {name[:32]}", callback_data=f"morebot_view_{bot_id}")])
     buttons.append([InlineKeyboardButton("🏠 Home", callback_data="ui_home")])
     return InlineKeyboardMarkup(buttons)
 
 async def more_bots_command(update, context):
     rows=get_more_bots(True)
     if not rows:
-        await update.effective_message.reply_text("🤖 <b>MORE BOTS</b>\n\nNo additional bots are available right now.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="ui_home")]]))
+        await update.effective_message.reply_text(
+            "🤖 <b>MORE BOTS</b>\n\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "✨ No additional bots are available right now.\n"
+            "━━━━━━━━━━━━━━━━━━",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="ui_home")]])
+        )
         return
-    lines=["🤖 <b>MORE BOTS</b>", "", "✨ Explore more useful bots from the admin's collection.", "", "👇 Select a bot to see its description:"]
+    lines=[
+        "🤖 <b>MORE BOTS</b>",
+        "━━━━━━━━━━━━━━━━━━",
+        "✨ <i>Explore useful bots from our collection.</i>",
+        "",
+        "👇 <b>Select a bot</b> to view its details:"
+    ]
+    for _, username, name, desc, _ in rows:
+        short=html.escape(desc[:90] + ("…" if len(desc)>90 else ""))
+        lines.append(f"\n🤖 <b>{html.escape(name)}</b>\n   📝 {short}")
+    lines.append("\n━━━━━━━━━━━━━━━━━━")
     await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=more_bots_keyboard())
 
 async def addbot_command(update, context):
@@ -369,12 +386,39 @@ async def bots_command(update, context):
 async def morebot_callback(update, context):
     query=update.callback_query
     await query.answer()
+
+    # Back button from a bot details page. It must be handled before
+    # parsing a bot id because callback_data is simply "more_bots".
+    if query.data == "more_bots":
+        rows=get_more_bots(True)
+        if not rows:
+            await query.edit_message_text(
+                "🤖 <b>MORE BOTS</b>\n\nNo additional bots are available right now.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="ui_home")]])
+            )
+            return
+        lines=[
+            "🤖 <b>MORE BOTS</b>",
+            "━━━━━━━━━━━━━━━━━━",
+            "✨ <i>Explore useful bots from our collection.</i>",
+            "",
+            "👇 <b>Select a bot</b> to view its details:"
+        ]
+        for _, username, name, desc, _ in rows:
+            short=html.escape(desc[:90] + ("…" if len(desc)>90 else ""))
+            lines.append(f"\n🤖 <b>{html.escape(name)}</b>\n   📝 {short}")
+        lines.append("\n━━━━━━━━━━━━━━━━━━")
+        await query.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=more_bots_keyboard())
+        return
+
     try: bot_id=int(query.data.rsplit('_',1)[1])
-    except (ValueError, IndexError): return
+    except (ValueError, IndexError):
+        return
     with db_connect() as conn:
         row=conn.execute("SELECT id,username,name,description,enabled FROM more_bots WHERE id=?", (bot_id,)).fetchone()
     if not row:
-        await query.edit_message_text("❌ This bot is no longer available.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🤖 More Bots", callback_data="more_bots")],[InlineKeyboardButton("🏠 Home", callback_data="ui_home")]]))
+        await query.edit_message_text("❌ This bot is no longer available.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🤖 𝗠𝗼𝗿𝗲 𝗕𝗼𝘁𝘀", callback_data="more_bots")],[InlineKeyboardButton("🏠 Home", callback_data="ui_home")]]))
         return
     _, username, name, description, enabled=row
     if query.data.startswith('morebot_delete_'):
@@ -388,7 +432,11 @@ async def morebot_callback(update, context):
           f"📝 <b>Description</b>\n{html.escape(description)}\n\n"
           f"🔗 <b>@{html.escape(username)}</b>\n\n"
           "✨ Tap below to open and use this bot.")
-    kb=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Open Bot", url=f"https://t.me/{username}")], [InlineKeyboardButton("⬅️ More Bots", callback_data="more_bots")], [InlineKeyboardButton("🏠 Home", callback_data="ui_home")]])
+    kb=InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚀 Open Bot", url=f"https://t.me/{username}")],
+        [InlineKeyboardButton("⬅️ Back to More Bots", callback_data="more_bots")],
+        [InlineKeyboardButton("🏠 Home", callback_data="ui_home")],
+    ])
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
 
 def admin_keyboard():
@@ -396,7 +444,7 @@ def admin_keyboard():
         [InlineKeyboardButton("📊 Dashboard", callback_data="admin_dashboard"), InlineKeyboardButton("👥 Users", callback_data="admin_users")],
         [InlineKeyboardButton("🔍 Search User", callback_data="admin_search"), InlineKeyboardButton("📈 Reports", callback_data="admin_reports")],
         [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"), InlineKeyboardButton("🔧 Maintenance", callback_data="admin_maintenance")],
-        [InlineKeyboardButton("📣 Announcement", callback_data="admin_announce"), InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings")],
+        [InlineKeyboardButton("📣 Announcement", callback_data="admin_announce"), InlineKeyboardButton("⚙️ 𝗦𝗲𝘁𝘁𝗶𝗻𝗴𝘀", callback_data="admin_settings")],
         [InlineKeyboardButton(f"🔧 M:{'ON' if maintenance_enabled() else 'OFF'}", callback_data="set_maintenance_toggle"), InlineKeyboardButton(f"🎵 D:{'ON' if feature_enabled('downloader') else 'OFF'}", callback_data="set_downloader_toggle")],
         [InlineKeyboardButton(f"📷 S:{'ON' if feature_enabled('qr_scanner') else 'OFF'}", callback_data="set_scanner_toggle"), InlineKeyboardButton(f"🔲 G:{'ON' if feature_enabled('qr_generator') else 'OFF'}", callback_data="set_generator_toggle")],
         [InlineKeyboardButton("🧪 System Status", callback_data="admin_status")],
@@ -1085,7 +1133,7 @@ def profile_keyboard():
 
 def user_features_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👤 My Profile", callback_data="user_profile"),
+        [InlineKeyboardButton("👤 𝗠𝘆 𝗣𝗿𝗼𝗳𝗶𝗹𝗲", callback_data="user_profile"),
          InlineKeyboardButton("📊 My Statistics", callback_data="user_stats")],
         [InlineKeyboardButton("📥 Download History", callback_data="hist_downloads")],
         [InlineKeyboardButton("📷 QR Scan History", callback_data="hist_scans"),
@@ -1165,18 +1213,34 @@ async def user_features_command(update, context):
 # ==================================================
 
 def get_main_keyboard(language="en", is_admin_user=False):
+    # Clean, balanced home keyboard. Unicode bold keeps the labels distinctive
+    # without relying on a custom font that Telegram clients may not support.
+    labels = {
+        "downloader": "📥 𝗗𝗼𝘄𝗻𝗹𝗼𝗮𝗱𝗲𝗿",
+        "scanner": "📷 𝗤𝗥 𝗦𝗰𝗮𝗻𝗻𝗲𝗿",
+        "generator": "🔲 𝗤𝗥 𝗚𝗲𝗻𝗲𝗿𝗮𝘁𝗼𝗿",
+        "stats": "📊 𝗠𝘆 𝗦𝘁𝗮𝘁𝘀",
+        "profile": "👤 𝗠𝘆 𝗣𝗿𝗼𝗳𝗶𝗹𝗲",
+        "more": "🤖 𝗠𝗼𝗿𝗲 𝗕𝗼𝘁𝘀",
+        "history": "🕘 𝗠𝘆 𝗛𝗶𝘀𝘁𝗼𝗿𝘆",
+        "settings": "⚙️ 𝗦𝗲𝘁𝘁𝗶𝗻𝗴𝘀",
+        "help": "❓ 𝗛𝗲𝗹𝗽",
+        "admin": "🛡️ 𝗔𝗱𝗺𝗶𝗻 𝗖𝗼𝗺𝗺𝗮𝗻𝗱𝘀",
+    }
+
+    def btn(text, style=None):
+        return KeyboardButton(text, style=style) if style else KeyboardButton(text)
+
     keyboard = [
-        ["📥 Downloader", "📷 QR Scanner"],
-        ["🔲 QR Generator", "📊 My Stats"],
-        ["👤 My Profile"],
-        ["🤖 More Bots"],
-        ["🕘 My History", "⚙️ Settings"],
-        ["❓ Help"],
+        [btn(labels["downloader"], "primary"), btn(labels["scanner"], "primary")],
+        [btn(labels["generator"], "primary"), btn(labels["more"], "success")],
+        [btn(labels["profile"]), btn(labels["stats"])],
+        [btn(labels["history"]), btn(labels["settings"])],
+        [btn(labels["help"])],
     ]
-    # Admin-only button: normal users never see this button.
     if is_admin_user:
-        keyboard.append(["🛡️ Admin Commands"])
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        keyboard.append([btn(labels["admin"], "primary")])
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
 
 def downloader_keyboard():
     return InlineKeyboardMarkup([
@@ -1197,7 +1261,7 @@ async def show_home(update, context):
     user = update.effective_user
     lang = get_user_language(user.id) if user else "en"
     reset_modes(context)
-    text = ("🤖 *ASSISTANT BOT-এ স্বাগতম!* 🚀\n\nআপনার All-in-One Telegram Utility Bot।\n\n📥 Downloader\n📷 QR Scanner\n🔲 QR Generator\n📊 Personal Statistics\n⚙️ Settings\n❓ Help\n\nনিচের Menu থেকে একটি অপশন নির্বাচন করুন।") if lang == "bn" else ("🤖 *Welcome to ASSISTANT BOT!* 🚀\n\nYour All-in-One Telegram Utility Bot.\n\n📥 Downloader\n📷 QR Scanner\n🔲 QR Generator\n📊 Personal Statistics\n⚙️ Settings\n❓ Help\n\nChoose an option from the menu below.")
+    text = ("🤖 *𝗔𝗦𝗦𝗜𝗦𝗧𝗔𝗡𝗧 𝗕𝗢𝗧*-এ স্বাগতম! ✨\n\n━━━━━━━━━━━━━━━━━━\n🚀 আপনার *All-in-One Telegram Utility Hub*\n━━━━━━━━━━━━━━━━━━\n\n📥 *𝗩𝗜𝗗𝗘𝗢 𝗧𝗢𝗢𝗟𝗦*\nDownloader\n\n📷 *𝗤𝗥 𝗧𝗢𝗢𝗟𝗦*\nQR Scanner • QR Generator\n\n👤 *𝗔𝗖𝗖𝗢𝗨𝗡𝗧*\nProfile • Statistics • History\n\n🤖 *𝗠𝗢𝗥𝗘*\nMore Bots\n\n⚙️ *𝗦𝗘𝗧𝗧𝗜𝗡𝗚𝗦*\nLanguage & preferences\n\n✨ নিচের সুন্দর Menu থেকে একটি অপশন নির্বাচন করুন।") if lang == "bn" else ("🤖 *𝗔𝗦𝗦𝗜𝗦𝗧𝗔𝗡𝗧 𝗕𝗢𝗧* — Welcome! ✨\n\n━━━━━━━━━━━━━━━━━━\n🚀 Your *All-in-One Telegram Utility Hub*\n━━━━━━━━━━━━━━━━━━\n\n📥 *𝗩𝗜𝗗𝗘𝗢 𝗧𝗢𝗢𝗟𝗦*\nDownloader\n\n📷 *𝗤𝗥 𝗧𝗢𝗢𝗟𝗦*\nQR Scanner • QR Generator\n\n👤 *𝗔𝗖𝗖𝗢𝗨𝗡𝗧*\nProfile • Statistics • History\n\n🤖 *𝗠𝗢𝗥𝗘*\nMore Bots\n\n⚙️ *𝗦𝗘𝗧𝗧𝗜𝗡𝗚𝗦*\nLanguage & preferences\n\n✨ Choose an option from the menu below.")
     await update.effective_message.reply_text(text, reply_markup=get_main_keyboard(lang, bool(user and is_admin(user.id))), parse_mode="Markdown")
 
 async def ui_callback(update, context):
@@ -1343,29 +1407,29 @@ async def help_command(update, context):
 async def ui_text_action(update, context, text):
     user = update.effective_user
     lang = get_user_language(user.id)
-    if text == "📥 Downloader":
+    if text == "📥 𝗗𝗼𝘄𝗻𝗹𝗼𝗮𝗱𝗲𝗿":
         reset_modes(context)
         await update.message.reply_text("📥 *Downloader*\n\nChoose a downloader:", reply_markup=downloader_keyboard(), parse_mode="Markdown")
         return True
-    if text == "📷 QR Scanner":
+    if text == "📷 𝗤𝗥 𝗦𝗰𝗮𝗻𝗻𝗲𝗿":
         await qr_scanner_start(update, context); return True
-    if text == "🔲 QR Generator":
+    if text == "🔲 𝗤𝗥 𝗚𝗲𝗻𝗲𝗿𝗮𝘁𝗼𝗿":
         await qr_generator_start(update, context); return True
-    if text == "📊 My Stats":
+    if text == "📊 𝗠𝘆 𝗦𝘁𝗮𝘁𝘀":
         messages, scans, generated, downloads = get_user_stats(user.id)
         msg = f"📊 *My Statistics*\n\n💬 Messages: *{messages}*\n📷 QR Scans: *{scans}*\n🔲 QR Generated: *{generated}*\n🎵 TikTok Downloads: *{downloads}*"
         await update.message.reply_text(msg, reply_markup=get_main_keyboard(lang, is_admin(user.id)), parse_mode="Markdown"); return True
-    if text == "👤 My Profile":
+    if text == "👤 𝗠𝘆 𝗣𝗿𝗼𝗳𝗶𝗹𝗲":
         await user_profile_command(update, context); return True
-    if text == "🤖 More Bots":
+    if text == "🤖 𝗠𝗼𝗿𝗲 𝗕𝗼𝘁𝘀":
         await more_bots_command(update, context); return True
-    if text == "🕘 My History":
+    if text == "🕘 𝗠𝘆 𝗛𝗶𝘀𝘁𝗼𝗿𝘆":
         await user_features_command(update, context); return True
-    if text == "⚙️ Settings":
+    if text == "⚙️ 𝗦𝗲𝘁𝘁𝗶𝗻𝗴𝘀":
         await settings_command(update, context); return True
-    if text == "❓ Help":
+    if text == "❓ 𝗛𝗲𝗹𝗽":
         await help_command(update, context); return True
-    if text == "🛡️ Admin Commands":
+    if text == "🛡️ 𝗔𝗱𝗺𝗶𝗻 𝗖𝗼𝗺𝗺𝗮𝗻𝗱𝘀":
         return await admin_help_button(update, context)
     return False
 

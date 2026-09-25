@@ -4,7 +4,7 @@ import html
 import tempfile
 import uuid
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
@@ -92,6 +92,14 @@ def init_database():
         conn.execute("""CREATE TABLE IF NOT EXISTS user_activity (
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
             action TEXT NOT NULL, details TEXT DEFAULT '', created_at TEXT NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS bot_settings (
+            key TEXT PRIMARY KEY, value TEXT NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS broadcast_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER NOT NULL,
+            kind TEXT NOT NULL, target_count INTEGER DEFAULT 0, sent INTEGER DEFAULT 0,
+            failed INTEGER DEFAULT 0, blocked INTEGER DEFAULT 0, created_at TEXT NOT NULL
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_download_history_user ON download_history(user_id, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_qr_scan_history_user ON qr_scan_history(user_id, id DESC)")
@@ -191,84 +199,233 @@ def format_dt(value):
 
 def get_stats():
     with db_connect() as conn:
-        row = conn.execute("""SELECT COUNT(*), SUM(CASE WHEN julianday(last_seen) >= julianday('now','-1 day') THEN 1 ELSE 0 END),
+        row = conn.execute("""SELECT COUNT(*),
+            SUM(CASE WHEN julianday(last_seen) >= julianday('now','-1 day') THEN 1 ELSE 0 END),
             COALESCE(SUM(messages),0), COALESCE(SUM(qr_scans),0), COALESCE(SUM(qr_generated),0),
             COALESCE(SUM(tiktok_downloads),0) FROM users""").fetchone()
-    return row
+    return tuple(x or 0 for x in row)
+
+def get_period_stats(days):
+    with db_connect() as conn:
+        return conn.execute("""SELECT COUNT(*), COALESCE(SUM(messages),0),
+            COALESCE(SUM(qr_scans),0), COALESCE(SUM(qr_generated),0),
+            COALESCE(SUM(tiktok_downloads),0)
+            FROM users WHERE last_seen >= ?""", ((datetime.now(timezone.utc)-timedelta(days=days)).isoformat(timespec='seconds'),)).fetchone()
+
+def get_user_by_id(user_id):
+    with db_connect() as conn:
+        return conn.execute("SELECT user_id, username, first_name, joined_at, last_seen, messages, qr_scans, qr_generated, tiktok_downloads, is_blocked FROM users WHERE user_id=?", (user_id,)).fetchone()
+
+def search_users(term, limit=10):
+    with db_connect() as conn:
+        like=f"%{term}%"
+        return conn.execute("SELECT user_id, username, first_name, last_seen, is_blocked FROM users WHERE CAST(user_id AS TEXT) LIKE ? OR username LIKE ? OR first_name LIKE ? ORDER BY last_seen DESC LIMIT ?", (like,like,like,limit)).fetchall()
+
+def set_blocked(user_id, blocked):
+    with db_connect() as conn:
+        conn.execute("UPDATE users SET is_blocked=? WHERE user_id=?", (1 if blocked else 0, user_id))
+        conn.commit()
+
+def maintenance_enabled():
+    with db_connect() as conn:
+        row=conn.execute("SELECT value FROM bot_settings WHERE key='maintenance' LIMIT 1").fetchone()
+    return bool(row and row[0]=='1')
+
+def set_maintenance(enabled):
+    with db_connect() as conn:
+        conn.execute("INSERT INTO bot_settings(key,value) VALUES('maintenance',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", ('1' if enabled else '0',))
+        conn.commit()
+
+def save_broadcast_report(admin_id, kind, target, sent, failed, blocked):
+    with db_connect() as conn:
+        conn.execute("INSERT INTO broadcast_reports(admin_id,kind,target_count,sent,failed,blocked,created_at) VALUES(?,?,?,?,?,?,?)", (admin_id,kind,target,sent,failed,blocked,utc_now()))
+        conn.commit()
 
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
 def admin_keyboard():
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("📊 Statistics", callback_data="admin_stats"),
-        InlineKeyboardButton("👥 Users", callback_data="admin_users")
-    ], [InlineKeyboardButton("📢 Broadcast Help", callback_data="admin_broadcast")]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Dashboard", callback_data="admin_dashboard"), InlineKeyboardButton("👥 Users", callback_data="admin_users")],
+        [InlineKeyboardButton("🔍 Search User", callback_data="admin_search"), InlineKeyboardButton("📈 Reports", callback_data="admin_reports")],
+        [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"), InlineKeyboardButton("🔧 Maintenance", callback_data="admin_maintenance")],
+        [InlineKeyboardButton("📣 Announcement", callback_data="admin_announce"), InlineKeyboardButton("🏠 Home", callback_data="ui_home")],
+    ])
 
 async def admin_panel(update, context):
     if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text(
-            f"⛔ You are not authorized to use the admin panel.\n\n"
-            f"🆔 Your Telegram ID: `{update.effective_user.id}`\n\n"
-            "Add this number to Render → Environment → ADMIN_IDS, then redeploy.",
-            parse_mode="Markdown"
-        )
+        await update.effective_message.reply_text(f"⛔ Admin only.\n\n🆔 Your Telegram ID: `{update.effective_user.id}`", parse_mode="Markdown")
         return
-    await update.effective_message.reply_text(
-        "🛠️ *ADMIN PANEL*\n\nChoose an option:", reply_markup=admin_keyboard(), parse_mode="Markdown")
+    await update.effective_message.reply_text("🛠️ *ADVANCED ADMIN PANEL*\n\nChoose an option:", reply_markup=admin_keyboard(), parse_mode="Markdown")
+
+async def dashboard_text():
+    total, active24, messages, scans, generated, downloads=get_stats()
+    d=get_period_stats(1); w=get_period_stats(7); m=get_period_stats(30)
+    return (f"📊 *ADMIN DASHBOARD*\n\n👥 Total Users: *{total}*\n🟢 Active 24h: *{active24}*\n\n"
+            f"📅 *Daily* — Users {d[0]} | DL {d[4]} | QR Scan {d[2]} | QR Gen {d[3]}\n"
+            f"📅 *Weekly* — Users {w[0]} | DL {w[4]} | QR Scan {w[2]} | QR Gen {w[3]}\n"
+            f"📅 *Monthly* — Users {m[0]} | DL {m[4]} | QR Scan {m[2]} | QR Gen {m[3]}\n\n"
+            f"💬 Messages: *{messages}*\n🎵 Downloads: *{downloads}*\n📷 QR Scans: *{scans}*\n🔲 QR Generated: *{generated}*\n🔧 Maintenance: *{'ON' if maintenance_enabled() else 'OFF'}*")
 
 async def stats_command(update, context):
     if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text("⛔ Admin only.")
-        return
-    total, active24, messages, scans, generated, downloads = get_stats()
-    await update.effective_message.reply_text(
-        f"📊 *BOT STATISTICS*\n\n👥 Total users: *{total}*\n🟢 Active (24h): *{active24}*\n💬 Messages: *{messages}*\n📷 QR scans: *{scans}*\n🔳 QR generated: *{generated}*\n🎵 TikTok downloads: *{downloads}*",
-        parse_mode="Markdown")
+        await update.effective_message.reply_text("⛔ Admin only."); return
+    await update.effective_message.reply_text(await dashboard_text(), parse_mode="Markdown", reply_markup=admin_keyboard())
+
+async def users_command(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Admin only."); return
+    with db_connect() as conn:
+        rows=conn.execute("SELECT user_id, username, first_name, last_seen, is_blocked FROM users ORDER BY last_seen DESC LIMIT 20").fetchall()
+    lines=["👥 *LATEST USERS*\n"]
+    for r in rows:
+        lines.append(f"• `{r[0]}` {('@'+r[1]) if r[1] else r[2] or 'User'} — {'🚫 Blocked' if r[4] else '🟢 Active'}")
+    await update.effective_message.reply_text("\n".join(lines) if rows else "No users yet.", parse_mode="Markdown", reply_markup=admin_keyboard())
+
+async def user_details_command(update, context):
+    if not is_admin(update.effective_user.id): await update.effective_message.reply_text("⛔ Admin only."); return
+    arg=update.message.text.partition(' ')[2].strip()
+    if not arg or not arg.isdigit():
+        await update.effective_message.reply_text("Usage: /user <telegram_id>"); return
+    r=get_user_by_id(int(arg))
+    if not r: await update.effective_message.reply_text("❌ User not found."); return
+    uid, username, name, joined, last, msgs, scans, gen, dl, blocked=r
+    await update.effective_message.reply_text(f"👤 *USER DETAILS*\n\n🆔 `{uid}`\n👤 {name or '—'}\n🔗 @{username or '—'}\n📅 Joined: {format_dt(joined)}\n🟢 Last active: {format_dt(last)}\n💬 Messages: {msgs}\n🎵 Downloads: {dl}\n📷 QR Scans: {scans}\n🔲 QR Generates: {gen}\n🚫 Blocked: {'Yes' if blocked else 'No'}\n\nUse /block {uid} or /unblock {uid}", parse_mode="Markdown", reply_markup=admin_keyboard())
+
+async def searchuser_command(update, context):
+    if not is_admin(update.effective_user.id): await update.effective_message.reply_text("⛔ Admin only."); return
+    term=update.message.text.partition(' ')[2].strip()
+    if not term: await update.effective_message.reply_text("Usage: /searchuser <ID or username>"); return
+    rows=search_users(term)
+    if not rows: await update.effective_message.reply_text("❌ No users found."); return
+    lines=["🔍 *SEARCH RESULTS*\n"]
+    for uid,un,name,last,blocked in rows:
+        lines.append(f"• `{uid}` {('@'+un) if un else name or 'User'} — {'🚫' if blocked else '🟢'}")
+    await update.effective_message.reply_text("\n".join(lines)+"\n\nUse /user <id> for details.", parse_mode="Markdown")
+
+async def block_command(update, context):
+    if not is_admin(update.effective_user.id): await update.effective_message.reply_text("⛔ Admin only."); return
+    arg=update.message.text.partition(' ')[2].strip()
+    if not arg.isdigit(): await update.effective_message.reply_text("Usage: /block <telegram_id>"); return
+    set_blocked(int(arg), True); log_activity(update.effective_user.id,"admin_block",arg)
+    await update.effective_message.reply_text(f"🚫 User `{arg}` blocked.", parse_mode="Markdown")
+
+async def unblock_command(update, context):
+    if not is_admin(update.effective_user.id): await update.effective_message.reply_text("⛔ Admin only."); return
+    arg=update.message.text.partition(' ')[2].strip()
+    if not arg.isdigit(): await update.effective_message.reply_text("Usage: /unblock <telegram_id>"); return
+    set_blocked(int(arg), False); log_activity(update.effective_user.id,"admin_unblock",arg)
+    await update.effective_message.reply_text(f"🔓 User `{arg}` unblocked.", parse_mode="Markdown")
+
+async def maintenance_command(update, context):
+    if not is_admin(update.effective_user.id): await update.effective_message.reply_text("⛔ Admin only."); return
+    arg=update.message.text.partition(' ')[2].strip().lower()
+    if arg in {'on','1','enable','enabled'}: set_maintenance(True)
+    elif arg in {'off','0','disable','disabled'}: set_maintenance(False)
+    else:
+        await update.effective_message.reply_text(f"🔧 Maintenance is currently *{'ON' if maintenance_enabled() else 'OFF'}*\n\nUse /maintenance on or /maintenance off", parse_mode="Markdown"); return
+    await update.effective_message.reply_text(f"🔧 Maintenance mode *{'ON' if maintenance_enabled() else 'OFF'}*", parse_mode="Markdown", reply_markup=admin_keyboard())
+
+async def announce_command(update, context):
+    if not is_admin(update.effective_user.id): await update.effective_message.reply_text("⛔ Admin only."); return
+    text=update.message.text.partition(' ')[2].strip()
+    if not text: await update.effective_message.reply_text("Usage: /announce <message>"); return
+    with db_connect() as conn: users=[r[0] for r in conn.execute("SELECT user_id FROM users WHERE is_blocked=0").fetchall()]
+    sent=failed=blocked=0
+    for uid in users:
+        try: await context.bot.send_message(uid, f"📣 *ADMIN ANNOUNCEMENT*\n\n{text}", parse_mode="Markdown"); sent+=1
+        except Exception as exc:
+            failed+=1
+            if 'blocked' in str(exc).lower() or 'chat not found' in str(exc).lower(): blocked+=1
+    save_broadcast_report(update.effective_user.id,'announcement',len(users),sent,failed,blocked)
+    await update.effective_message.reply_text(f"📣 Announcement complete.\n\n📨 Sent: {sent}\n⚠️ Failed: {failed}\n🚫 Blocked: {blocked}")
 
 async def broadcast_command(update, context):
-    if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text("⛔ Admin only.")
-        return
-    text = update.message.text.partition(" ")[2].strip()
+    if not is_admin(update.effective_user.id): await update.effective_message.reply_text("⛔ Admin only."); return
+    text=update.message.text.partition(' ')[2].strip()
     if not text:
-        await update.effective_message.reply_text("📢 Usage: /broadcast Your message here")
-        return
-    with db_connect() as conn:
-        users = [r[0] for r in conn.execute("SELECT user_id FROM users WHERE is_blocked=0").fetchall()]
-    sent = failed = 0
-    status = await update.effective_message.reply_text(f"📢 Broadcasting to {len(users)} users...\n`0%`", parse_mode="Markdown")
-    for i, uid in enumerate(users, 1):
-        try:
-            await context.bot.send_message(chat_id=uid, text=text)
-            sent += 1
+        await update.effective_message.reply_text("📢 Usage: /broadcast <text>\n\nFor photo/video/document: reply to that media and use /broadcast_media\nFor button: /broadcast_button Button Text | https://example.com"); return
+    with db_connect() as conn: users=[r[0] for r in conn.execute("SELECT user_id FROM users WHERE is_blocked=0").fetchall()]
+    sent=failed=blocked=0
+    for uid in users:
+        try: await context.bot.send_message(uid,text=text); sent+=1
         except Exception as exc:
-            failed += 1
-            if "blocked" in str(exc).lower() or "chat not found" in str(exc).lower():
-                with db_connect() as conn:
-                    conn.execute("UPDATE users SET is_blocked=1 WHERE user_id=?", (uid,))
-                    conn.commit()
-        if i == len(users) or i % max(1, len(users)//10) == 0:
-            try:
-                await status.edit_text(f"📢 Broadcasting...\n`{i*100//max(1,len(users))}%`", parse_mode="Markdown")
-            except Exception:
-                pass
-    await status.edit_text(f"✅ *Broadcast complete*\n\n📨 Sent: *{sent}*\n⚠️ Failed: *{failed}*", parse_mode="Markdown")
+            failed+=1
+            if 'blocked' in str(exc).lower() or 'chat not found' in str(exc).lower(): blocked+=1
+    save_broadcast_report(update.effective_user.id,'text',len(users),sent,failed,blocked)
+    pct=(sent*100/len(users)) if users else 0
+    await update.effective_message.reply_text(f"✅ *Broadcast delivery report*\n\n👥 Target: {len(users)}\n📨 Sent: {sent}\n⚠️ Failed: {failed}\n🚫 Blocked: {blocked}\n📈 Delivery: {pct:.1f}%", parse_mode="Markdown")
+
+async def broadcast_media_command(update, context):
+    if not is_admin(update.effective_user.id): await update.effective_message.reply_text("⛔ Admin only."); return
+    reply=update.message.reply_to_message
+    if not reply or not (reply.photo or reply.video or reply.document):
+        await update.effective_message.reply_text("Reply to a photo, video, or document with /broadcast_media"); return
+    with db_connect() as conn: users=[r[0] for r in conn.execute("SELECT user_id FROM users WHERE is_blocked=0").fetchall()]
+    sent=failed=blocked=0
+    for uid in users:
+        try:
+            if reply.photo: await context.bot.send_photo(uid, reply.photo[-1].file_id, caption=reply.caption or '')
+            elif reply.video: await context.bot.send_video(uid, reply.video.file_id, caption=reply.caption or '')
+            else: await context.bot.send_document(uid, reply.document.file_id, caption=reply.caption or '')
+            sent+=1
+        except Exception as exc:
+            failed+=1
+            if 'blocked' in str(exc).lower() or 'chat not found' in str(exc).lower(): blocked+=1
+    kind='photo' if reply.photo else 'video' if reply.video else 'document'
+    save_broadcast_report(update.effective_user.id,kind,len(users),sent,failed,blocked)
+    await update.effective_message.reply_text(f"✅ *{kind.title()} broadcast report*\n\nTarget: {len(users)}\nSent: {sent}\nFailed: {failed}\nBlocked: {blocked}",parse_mode='Markdown')
+
+async def broadcast_button_command(update, context):
+    if not is_admin(update.effective_user.id): await update.effective_message.reply_text("⛔ Admin only."); return
+    arg=update.message.text.partition(' ')[2].strip()
+    if '|' not in arg: await update.effective_message.reply_text("Usage: /broadcast_button Button Text | https://example.com"); return
+    label,url=[x.strip() for x in arg.split('|',1)]
+    if not label or not url.startswith(('http://','https://')): await update.effective_message.reply_text("❌ Invalid button or URL."); return
+    with db_connect() as conn: users=[r[0] for r in conn.execute("SELECT user_id FROM users WHERE is_blocked=0").fetchall()]
+    sent=failed=blocked=0
+    kb=InlineKeyboardMarkup([[InlineKeyboardButton(label,url=url)]])
+    for uid in users:
+        try: await context.bot.send_message(uid,"📢 *ADMIN BROADCAST*",parse_mode='Markdown',reply_markup=kb); sent+=1
+        except Exception as exc:
+            failed+=1
+            if 'blocked' in str(exc).lower() or 'chat not found' in str(exc).lower(): blocked+=1
+    save_broadcast_report(update.effective_user.id,'button',len(users),sent,failed,blocked)
+    await update.effective_message.reply_text(f"✅ Button broadcast report\n\nTarget: {len(users)}\nSent: {sent}\nFailed: {failed}\nBlocked: {blocked}")
+
+async def reports_command(update, context):
+    if not is_admin(update.effective_user.id): await update.effective_message.reply_text("⛔ Admin only."); return
+    with db_connect() as conn: rows=conn.execute("SELECT kind,target_count,sent,failed,blocked,created_at FROM broadcast_reports ORDER BY id DESC LIMIT 10").fetchall()
+    if not rows: await update.effective_message.reply_text("📈 No broadcast reports yet.",reply_markup=admin_keyboard()); return
+    lines=['📈 *BROADCAST REPORTS*\n']
+    for kind,target,sent,failed,blocked,created in rows: lines.append(f"• {kind} — {sent}/{target} sent, {failed} failed, {blocked} blocked\n  {format_dt(created)}")
+    await update.effective_message.reply_text('\n'.join(lines),parse_mode='Markdown',reply_markup=admin_keyboard())
 
 async def admin_callback(update, context):
-    query = update.callback_query
-    await query.answer()
-    if not is_admin(query.from_user.id):
-        await query.edit_message_text("⛔ Admin only.")
+    query=update.callback_query; await query.answer()
+    if not is_admin(query.from_user.id): await query.edit_message_text('⛔ Admin only.'); return
+    d=query.data
+    if d in {'admin_dashboard','admin_stats'}: await query.edit_message_text(await dashboard_text(),parse_mode='Markdown',reply_markup=admin_keyboard())
+    elif d=='admin_users': await query.edit_message_text('👥 *USER MANAGEMENT*\n\n/searchuser <id or username>\n/user <telegram_id>\n/block <telegram_id>\n/unblock <telegram_id>',parse_mode='Markdown',reply_markup=admin_keyboard())
+    elif d=='admin_search': await query.edit_message_text('🔍 *USER SEARCH*\n\nUse /searchuser <ID or username>',parse_mode='Markdown',reply_markup=admin_keyboard())
+    elif d=='admin_reports':
+        with db_connect() as conn: rows=conn.execute("SELECT kind,target_count,sent,failed,blocked,created_at FROM broadcast_reports ORDER BY id DESC LIMIT 10").fetchall()
+        txt='📈 *BROADCAST REPORTS*\n\n'+('\n'.join(f'• {k}: {s}/{t} sent | {f} failed | {b} blocked\n  {format_dt(c)}' for k,t,s,f,b,c in rows) if rows else 'No reports yet.')
+        await query.edit_message_text(txt,parse_mode='Markdown',reply_markup=admin_keyboard())
+    elif d=='admin_broadcast': await query.edit_message_text('📢 *BROADCAST*\n\n/broadcast <text>\n/broadcast_media — reply to photo/video/document\n/broadcast_button Button Text | https://example.com',parse_mode='Markdown',reply_markup=admin_keyboard())
+    elif d=='admin_maintenance': await query.edit_message_text(f"🔧 *MAINTENANCE*\n\nCurrent: *{'ON' if maintenance_enabled() else 'OFF'}*\n\n/maintenance on\n/maintenance off",parse_mode='Markdown',reply_markup=admin_keyboard())
+    elif d=='admin_announce': await query.edit_message_text('📣 *ADMIN ANNOUNCEMENT*\n\n/announce <message>',parse_mode='Markdown',reply_markup=admin_keyboard())
+
+async def maintenance_guard(update, context):
+    user=update.effective_user
+    if not user or is_admin(user.id) or not maintenance_enabled():
         return
-    if query.data == "admin_stats":
-        total, active24, messages, scans, generated, downloads = get_stats()
-        await query.edit_message_text(f"📊 *BOT STATISTICS*\n\n👥 Total users: *{total}*\n🟢 Active (24h): *{active24}*\n💬 Messages: *{messages}*\n📷 QR scans: *{scans}*\n🔳 QR generated: *{generated}*\n🎵 TikTok downloads: *{downloads}*", parse_mode="Markdown", reply_markup=admin_keyboard())
-    elif query.data == "admin_users":
-        total, active24, *_ = get_stats()
-        await query.edit_message_text(f"👥 *USER DATABASE*\n\nTotal registered users: *{total}*\nActive in last 24h: *{active24}*\n\nUse /broadcast <message> to send a broadcast.", parse_mode="Markdown", reply_markup=admin_keyboard())
-    elif query.data == "admin_broadcast":
-        await query.edit_message_text("📢 *BROADCAST*\n\nSend:\n`/broadcast Your message here`\n\nThe bot will send it to all registered users.", parse_mode="Markdown", reply_markup=admin_keyboard())
+    if user and get_user_by_id(user.id) and get_user_by_id(user.id)[9]:
+        return
+    msg=update.effective_message
+    if msg:
+        await msg.reply_text("🔧 Bot maintenance mode is ON.\n\nPlease try again later.")
+    raise Exception("MAINTENANCE_BLOCKED")
 
 async def track_update(update, context):
     if update.effective_user:
@@ -1476,6 +1633,9 @@ def main():
         .build()
     )
 
+    # Phase 5: maintenance guard for non-admin users
+    app.add_handler(MessageHandler(filters.ALL, maintenance_guard), group=-2)
+
     # Phase 3: track every update before normal handlers
     app.add_handler(MessageHandler(filters.ALL, track_update), group=-1)
 
@@ -1484,12 +1644,22 @@ def main():
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CommandHandler("broadcast_media", broadcast_media_command))
+    app.add_handler(CommandHandler("broadcast_button", broadcast_button_command))
+    app.add_handler(CommandHandler("reports", reports_command))
+    app.add_handler(CommandHandler("users", users_command))
+    app.add_handler(CommandHandler("user", user_details_command))
+    app.add_handler(CommandHandler("searchuser", searchuser_command))
+    app.add_handler(CommandHandler("block", block_command))
+    app.add_handler(CommandHandler("unblock", unblock_command))
+    app.add_handler(CommandHandler("maintenance", maintenance_command))
+    app.add_handler(CommandHandler("announce", announce_command))
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("profile", user_profile_command))
     app.add_handler(CommandHandler("mystats", user_stats_view))
     app.add_handler(CommandHandler("history", user_features_command))
-    app.add_handler(CallbackQueryHandler(ui_callback, pattern=r"^(ui_|lang_)"))
+    app.add_handler(CallbackQueryHandler(ui_callback, pattern=r"^(ui_|lang_|user_profile$|user_stats$|hist_(downloads|scans|generates|activity)$)"))
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin_"))
 
     # ==========================================

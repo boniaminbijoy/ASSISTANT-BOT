@@ -49,11 +49,6 @@ if not BOT_TOKEN:
 DB_PATH = os.environ.get("BOT_DB_PATH", "bot_data.db")
 ADMIN_IDS = {int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").replace(";", ",").split(",") if x.strip().isdigit()}
 
-# Increment this when the user-facing reply-keyboard menu logic changes.
-# Existing users will automatically receive the new menu on their next interaction;
-# they do not need to press /start.
-MENU_VERSION = "23"
-
 
 async def myid_command(update, context):
     """Show the Telegram numeric user ID needed for ADMIN_IDS."""
@@ -83,8 +78,6 @@ def init_database():
         cols = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
         if "language" not in cols:
             conn.execute("ALTER TABLE users ADD COLUMN language TEXT DEFAULT 'en'")
-        if "menu_version" not in cols:
-            conn.execute("ALTER TABLE users ADD COLUMN menu_version TEXT DEFAULT ''")
         conn.execute("""CREATE TABLE IF NOT EXISTS download_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
             platform TEXT NOT NULL, url TEXT NOT NULL, quality TEXT DEFAULT '',
@@ -796,52 +789,9 @@ async def maintenance_guard(update, context):
             await update.callback_query.answer("🔧 Bot maintenance mode is ON.", show_alert=True)
         raise ApplicationHandlerStop
 
-async def ensure_latest_menu(update, context):
-    """Automatically migrate a user's reply keyboard to the current menu version.
-
-    Telegram reply keyboards cannot be edited in-place after they were sent.
-    Instead, the bot sends the new keyboard once when it detects that the user's
-    stored menu version is older than MENU_VERSION. This happens on the user's
-    next interaction, so /start is no longer required after a deployment.
-    """
-    user = update.effective_user
-    msg = update.effective_message
-    if not user or not msg:
-        return
-
-    # Only private chats should receive the personal main menu.
-    if getattr(msg.chat, "type", None) != "private":
-        return
-
-    # Admins and normal users can both use the latest menu; blocked/maintenance
-    # users are stopped earlier by maintenance_guard (group -2).
-    try:
-        with db_connect() as conn:
-            row = conn.execute("SELECT menu_version, language FROM users WHERE user_id = ?", (user.id,)).fetchone()
-            current = row[0] if row else ""
-            language = row[1] if row and row[1] in {"bn", "en"} else "en"
-
-        if current == MENU_VERSION:
-            return
-
-        await msg.reply_text(
-            "🔄 <b>Menu Updated</b>\n\n"
-            "নতুন menu automatically চালু হয়েছে। /start চাপতে হবে না।" if language == "bn" else
-            "🔄 <b>Menu Updated</b>\n\nThe latest menu is now active automatically. You do not need to press /start.",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard(language),
-        )
-        with db_connect() as conn:
-            conn.execute("UPDATE users SET menu_version = ?, last_seen = ? WHERE user_id = ?", (MENU_VERSION, utc_now(), user.id))
-            conn.commit()
-    except Exception as exc:
-        print("Menu auto-update error:", repr(exc))
-
-
 async def track_update(update, context):
     if update.effective_user:
         register_user(update.effective_user, count_message=bool(update.effective_message))
-        await ensure_latest_menu(update, context)
         try:
             if update.callback_query:
                 action = "button_click"
@@ -971,13 +921,16 @@ async def user_features_command(update, context):
 # MAIN MENU
 # ==================================================
 
-def get_main_keyboard(language="en"):
+def get_main_keyboard(language="en", is_admin_user=False):
     keyboard = [
         ["📥 Downloader", "📷 QR Scanner"],
         ["🔲 QR Generator", "📊 My Stats"],
         ["👤 My Profile", "🕘 My History"],
         ["⚙️ Settings", "❓ Help"],
     ]
+    # Admin-only button: normal users never see this button.
+    if is_admin_user:
+        keyboard.append(["🛡️ Admin Commands"])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 def downloader_keyboard():
@@ -1000,7 +953,7 @@ async def show_home(update, context):
     lang = get_user_language(user.id) if user else "en"
     reset_modes(context)
     text = ("🤖 *ASSISTANT BOT-এ স্বাগতম!* 🚀\n\nআপনার All-in-One Telegram Utility Bot।\n\n📥 Downloader\n📷 QR Scanner\n🔲 QR Generator\n📊 Personal Statistics\n⚙️ Settings\n❓ Help\n\nনিচের Menu থেকে একটি অপশন নির্বাচন করুন।") if lang == "bn" else ("🤖 *Welcome to ASSISTANT BOT!* 🚀\n\nYour All-in-One Telegram Utility Bot.\n\n📥 Downloader\n📷 QR Scanner\n🔲 QR Generator\n📊 Personal Statistics\n⚙️ Settings\n❓ Help\n\nChoose an option from the menu below.")
-    await update.effective_message.reply_text(text, reply_markup=get_main_keyboard(lang), parse_mode="Markdown")
+    await update.effective_message.reply_text(text, reply_markup=get_main_keyboard(lang, bool(user and is_admin(user.id))), parse_mode="Markdown")
 
 async def ui_callback(update, context):
     query = update.callback_query
@@ -1042,7 +995,99 @@ async def ui_callback(update, context):
     elif query.data in {"lang_bn", "lang_en"}:
         lang = "bn" if query.data == "lang_bn" else "en"
         set_user_language(user.id, lang)
-        await query.message.reply_text("✅ ভাষা বাংলা করা হয়েছে।" if lang == "bn" else "✅ Language changed to English.", reply_markup=get_main_keyboard(lang))
+        await query.message.reply_text("✅ ভাষা বাংলা করা হয়েছে।" if lang == "bn" else "✅ Language changed to English.", reply_markup=get_main_keyboard(lang, is_admin(user.id)))
+
+def admin_help_keyboard(page=1):
+    buttons = []
+    if page > 1:
+        buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"admin_help_{page-1}"))
+    if page < 3:
+        buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"admin_help_{page+1}"))
+    rows = [buttons] if buttons else []
+    rows.append([InlineKeyboardButton("🛠️ Admin Panel", callback_data="admin_dashboard"),
+                 InlineKeyboardButton("🏠 Home", callback_data="ui_home")])
+    return InlineKeyboardMarkup(rows)
+
+ADMIN_HELP_PAGES = {
+    1: (
+        "🛡️ <b>ADMIN COMMANDS — 1/3</b>\n\n"
+        "📊 <b>Dashboard & Statistics</b>\n"
+        "/admin — Open Admin Panel\n"
+        "/stats — Dashboard/statistics overview\n"
+        "/users — Latest users list\n"
+        "/activeusers — Users active in last 24h\n"
+        "/newuser — New users today\n"
+        "/topuser — Most active users\n"
+        "/usercount — Total and blocked user count\n"
+        "/reports — Broadcast delivery reports\n\n"
+        "👥 <b>User Management</b>\n"
+        "/searchuser &lt;id|username&gt; — Search a user\n"
+        "/user &lt;id&gt; — View user details\n\n"
+        "🚫 <b>User Control</b>\n"
+        "/block &lt;id&gt; — Block a user\n"
+        "/unblock &lt;id&gt; — Remove block\n"
+        "/ban &lt;id&gt; — Ban (same block system)\n"
+        "/unban &lt;id&gt; — Remove ban\n"
+    ),
+    2: (
+        "🛡️ <b>ADMIN COMMANDS — 2/3</b>\n\n"
+        "👑 <b>Admin Management</b>\n"
+        "/adminlist — Show admin list\n"
+        "/addadmin &lt;id&gt; — Add an admin\n"
+        "/deladmin &lt;id&gt; — Remove a database admin\n\n"
+        "📢 <b>Broadcast</b>\n"
+        "/broadcast &lt;text&gt; — Text broadcast\n"
+        "/broadcast_media — Broadcast replied photo/video/document\n"
+        "/broadcast_button — Broadcast with URL button\n"
+        "/announce &lt;message&gt; — Send admin announcement\n"
+        "/reports — View recent broadcast reports\n\n"
+        "🔧 <b>Bot Control</b>\n"
+        "/maintenance on|off — Enable/disable maintenance mode\n"
+        "/restart — Restart the Render service process\n"
+        "/ping — Check bot response time\n"
+    ),
+    3: (
+        "🛡️ <b>ADMIN COMMANDS — 3/3</b>\n\n"
+        "ℹ️ <b>Information & Help</b>\n"
+        "/about — Bot information\n"
+        "/support — Support information\n"
+        "/helpuser — Show user commands\n"
+        "/helpadmin — Show admin command list\n"
+        "/id or /myid — Show your Telegram ID\n\n"
+        "📌 <b>Quick Examples</b>\n"
+        "/block 123456789\n"
+        "/unblock 123456789\n"
+        "/user 123456789\n"
+        "/searchuser 123456789\n"
+        "/addadmin 123456789\n"
+        "/maintenance on\n"
+        "/broadcast Hello everyone!\n"
+        "/announce Important notice\n\n"
+        "🔐 <b>Security:</b> These commands are available only to verified admins.\n"
+        "⚠️ Admin IDs configured in Render <code>ADMIN_IDS</code> cannot be removed with /deladmin."
+    ),
+}
+
+async def admin_help_button(update, context):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await update.effective_message.reply_text("⛔ Admin only.")
+        return True
+    await update.effective_message.reply_text(ADMIN_HELP_PAGES[1], parse_mode="HTML", reply_markup=admin_help_keyboard(1))
+    return True
+
+async def admin_help_callback(update, context):
+    query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("⛔ Admin only.", show_alert=True)
+        return
+    try:
+        page = int(query.data.rsplit("_", 1)[1])
+    except (ValueError, IndexError):
+        page = 1
+    page = max(1, min(3, page))
+    await query.answer()
+    await query.edit_message_text(ADMIN_HELP_PAGES[page], parse_mode="HTML", reply_markup=admin_help_keyboard(page))
 
 async def settings_command(update, context):
     await update.effective_message.reply_text("⚙️ *Settings*\n\nChoose your language:", reply_markup=settings_keyboard(), parse_mode="Markdown")
@@ -1064,7 +1109,7 @@ async def ui_text_action(update, context, text):
     if text == "📊 My Stats":
         messages, scans, generated, downloads = get_user_stats(user.id)
         msg = f"📊 *My Statistics*\n\n💬 Messages: *{messages}*\n📷 QR Scans: *{scans}*\n🔲 QR Generated: *{generated}*\n🎵 TikTok Downloads: *{downloads}*"
-        await update.message.reply_text(msg, reply_markup=get_main_keyboard(lang), parse_mode="Markdown"); return True
+        await update.message.reply_text(msg, reply_markup=get_main_keyboard(lang, is_admin(user.id)), parse_mode="Markdown"); return True
     if text == "👤 My Profile":
         await user_profile_command(update, context); return True
     if text == "🕘 My History":
@@ -1073,6 +1118,8 @@ async def ui_text_action(update, context, text):
         await settings_command(update, context); return True
     if text == "❓ Help":
         await help_command(update, context); return True
+    if text == "🛡️ Admin Commands":
+        return await admin_help_button(update, context)
     return False
 
 def make_progress_bar(percent: int, width: int = 10) -> str:
@@ -2042,39 +2089,6 @@ async def handle_text(
 
 
 # ==================================================
-# APPLICATION STARTUP
-# ==================================================
-
-async def post_init(application):
-    """Run startup tasks through PTB's supported post_init lifecycle hook."""
-    await application.bot.set_my_commands([
-        ("start", "Open main menu"), ("help", "Help"), ("profile", "My Profile"),
-        ("mystats", "My Statistics"), ("history", "My History"), ("settings", "Settings"),
-        ("support", "Contact Admin")
-    ])
-    if application.job_queue:
-        # Restore pending schedules after a Render restart.
-        with db_connect() as conn:
-            rows = conn.execute(
-                "SELECT id,admin_id,message,run_at FROM scheduled_broadcasts WHERE status='scheduled'"
-            ).fetchall()
-        now = datetime.now(timezone.utc)
-        for sid, aid, msg, run in rows:
-            try:
-                when = datetime.fromisoformat(run)
-                if when <= now:
-                    when = now + timedelta(seconds=2)
-                application.job_queue.run_once(
-                    scheduled_broadcast_job,
-                    when=when,
-                    data={"id": sid, "admin_id": aid, "message": msg},
-                    name=f"scheduled_{sid}",
-                )
-            except Exception as exc:
-                save_error(aid, "schedule_restore", repr(exc))
-
-
-# ==================================================
 # MAIN
 # ==================================================
 
@@ -2086,7 +2100,6 @@ def main():
         Application
         .builder()
         .token(BOT_TOKEN)
-        .post_init(post_init)
         .build()
     )
 
@@ -2136,6 +2149,7 @@ def main():
     app.add_handler(CommandHandler("mystats", user_stats_view))
     app.add_handler(CommandHandler("history", user_features_command))
     app.add_handler(CallbackQueryHandler(ui_callback, pattern=r"^(ui_|lang_|user_profile$|user_stats$|hist_(downloads|scans|generates|activity)$)"))
+    app.add_handler(CallbackQueryHandler(admin_help_callback, pattern=r"^admin_help_[123]$"))
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^(admin_|set_)"))
 
     # ==========================================
@@ -2183,6 +2197,27 @@ def main():
     Thread(target=start_web_server, daemon=True).start()
 
     app.add_error_handler(error_monitor)
+    # Automatic command menu: users do not need /start to discover the latest commands.
+    async def post_init(application):
+        await application.bot.set_my_commands([
+            ("start", "Open main menu"), ("help", "Help"), ("profile", "My Profile"),
+            ("mystats", "My Statistics"), ("history", "My History"), ("settings", "Settings"),
+            ("support", "Contact Admin")
+        ])
+        if application.job_queue:
+            # Restore pending schedules after a Render restart.
+            with db_connect() as conn:
+                rows=conn.execute("SELECT id,admin_id,message,run_at FROM scheduled_broadcasts WHERE status='scheduled'").fetchall()
+            now=datetime.now(timezone.utc)
+            for sid,aid,msg,run in rows:
+                try:
+                    when=datetime.fromisoformat(run)
+                    if when <= now:
+                        when=now+timedelta(seconds=2)
+                    application.job_queue.run_once(scheduled_broadcast_job, when=when, data={'id':sid,'admin_id':aid,'message':msg}, name=f'scheduled_{sid}')
+                except Exception as exc:
+                    save_error(aid, "schedule_restore", repr(exc))
+    app.post_init = post_init
     app.run_polling()
 
 

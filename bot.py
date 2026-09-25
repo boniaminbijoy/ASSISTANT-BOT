@@ -5,6 +5,7 @@ import tempfile
 import uuid
 import sqlite3
 import traceback
+import re
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
@@ -47,7 +48,7 @@ if not BOT_TOKEN:
 # PHASE 3 - USER DATABASE / ADMIN CONFIG
 # ==================================================
 DB_PATH = os.environ.get("BOT_DB_PATH", "bot_data.db")
-ADMIN_IDS = {int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").replace(";", ",").split(",") if x.strip().isdigit()}
+ADMIN_IDS = {int(x) for x in re.findall(r"\d+", os.environ.get("ADMIN_IDS", ""))}
 
 
 async def myid_command(update, context):
@@ -290,6 +291,7 @@ def save_broadcast_report(admin_id, kind, target, sent, failed, blocked):
         conn.commit()
 
 def is_admin(user_id):
+    # Accept ADMIN_IDS values separated by commas, spaces, semicolons or newlines.
     if user_id in ADMIN_IDS:
         return True
     try:
@@ -1398,6 +1400,17 @@ async def admin_help_callback(update, context):
     await query.answer()
     await query.edit_message_text(ADMIN_HELP_PAGES[page], parse_mode="HTML", reply_markup=admin_help_keyboard(page))
 
+async def admin_menu_command(update, context):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        return
+    lang = get_user_language(user.id)
+    await update.effective_message.reply_text(
+        "🛡️ <b>ADMIN MENU</b>\n\nChoose an admin option below.",
+        parse_mode="HTML",
+        reply_markup=get_main_keyboard(lang, True),
+    )
+
 async def settings_command(update, context):
     await update.effective_message.reply_text("⚙️ *Settings*\n\nChoose your language:", reply_markup=settings_keyboard(), parse_mode="Markdown")
 
@@ -1429,7 +1442,7 @@ async def ui_text_action(update, context, text):
         await settings_command(update, context); return True
     if text == "❓ 𝗛𝗲𝗹𝗽":
         await help_command(update, context); return True
-    if text == "🛡️ 𝗔𝗱𝗺𝗶𝗻 𝗖𝗼𝗺𝗺𝗮𝗻𝗱𝘀":
+    if text in {"🛡️ 𝗔𝗱𝗺𝗶𝗻 𝗖𝗼𝗺𝗺𝗮𝗻𝗱𝘀", "🛡️ Admin Commands"}:
         return await admin_help_button(update, context)
     return False
 
@@ -2458,6 +2471,7 @@ def main():
     app.add_handler(CommandHandler("cancelschedule", cancel_schedule_command))
     app.add_handler(CommandHandler("reply", reply_user_command))
     app.add_handler(CommandHandler("settings", settings_command))
+    app.add_handler(CommandHandler("admin_menu", admin_menu_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("profile", user_profile_command))
     app.add_handler(CommandHandler("mystats", user_stats_view))

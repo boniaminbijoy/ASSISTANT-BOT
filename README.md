@@ -18,3 +18,7 @@ Telegram bot with:
 
 ## Deployment
 The Dockerfile installs `libzbar0`, which is required by pyzbar on Debian/Ubuntu-style Linux systems.
+
+
+## Render native Python runtime
+This project does not require the system ZBar library at startup. QR scanning uses OpenCV first and treats pyzbar/ZBar as an optional fallback. This avoids a startup crash on Render's native Python runtime, where `libzbar0` is not installed by `requirements.txt`.

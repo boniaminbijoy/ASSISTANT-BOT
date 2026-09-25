@@ -12,7 +12,16 @@ from typing import List
 
 import cv2
 from PIL import Image, ImageOps
-from pyzbar.pyzbar import ZBarSymbol, decode as zbar_decode
+# pyzbar is optional at import time.
+# Render's native Python runtime does not provide the system zbar library
+# unless it is installed separately. OpenCV remains the primary scanner.
+try:
+    from pyzbar.pyzbar import ZBarSymbol, decode as zbar_decode
+    PYZBAR_AVAILABLE = True
+except Exception:
+    ZBarSymbol = None
+    zbar_decode = None
+    PYZBAR_AVAILABLE = False
 
 
 def _unique(values: list[str]) -> list[str]:
@@ -50,6 +59,8 @@ def _opencv_decode(image) -> list[str]:
 
 
 def _zbar_decode(image) -> list[str]:
+    if not PYZBAR_AVAILABLE or zbar_decode is None or ZBarSymbol is None:
+        return []
     results: list[str] = []
     try:
         decoded = zbar_decode(image, symbols=[ZBarSymbol.QRCODE])

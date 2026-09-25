@@ -73,6 +73,9 @@ def init_database():
             tiktok_downloads INTEGER DEFAULT 0, is_blocked INTEGER DEFAULT 0
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen)")
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "language" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN language TEXT DEFAULT 'en'")
         conn.commit()
 
 def utc_now():
@@ -97,6 +100,25 @@ def increment_stat(user_id, field):
     with db_connect() as conn:
         conn.execute(f"UPDATE users SET {field} = {field} + 1, last_seen = ? WHERE user_id = ?", (utc_now(), user_id))
         conn.commit()
+
+def get_user_language(user_id):
+    try:
+        with db_connect() as conn:
+            row = conn.execute("SELECT language FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        return row[0] if row and row[0] in {"bn", "en"} else "en"
+    except Exception:
+        return "en"
+
+def set_user_language(user_id, language):
+    if language not in {"bn", "en"}:
+        return
+    with db_connect() as conn:
+        conn.execute("UPDATE users SET language = ? WHERE user_id = ?", (language, user_id))
+        conn.commit()
+
+def get_user_stats(user_id):
+    with db_connect() as conn:
+        return conn.execute("SELECT messages, qr_scans, qr_generated, tiktok_downloads FROM users WHERE user_id = ?", (user_id,)).fetchone() or (0, 0, 0, 0)
 
 def get_stats():
     with db_connect() as conn:
@@ -211,21 +233,81 @@ def start_web_server():
 # MAIN MENU
 # ==================================================
 
-def get_main_keyboard():
-
+def get_main_keyboard(language="en"):
     keyboard = [
-        ["📷 QR CODE SCANNER"],
-        ["🔳 QR CODE GENERATOR"],
-        ["🎵 TIKTOK DOWNLOADER"]
+        ["📥 Downloader", "📷 QR Scanner"],
+        ["🔲 QR Generator", "📊 My Stats"],
+        ["⚙️ Settings", "❓ Help"],
     ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-    return ReplyKeyboardMarkup(
-        keyboard,
-        resize_keyboard=True
-    )
+def downloader_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎵 TikTok Downloader", callback_data="ui_tiktok")],
+        [InlineKeyboardButton("🏠 Home", callback_data="ui_home")],
+    ])
 
+def settings_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🇧🇩 বাংলা", callback_data="lang_bn"), InlineKeyboardButton("🇬🇧 English", callback_data="lang_en")],
+        [InlineKeyboardButton("🏠 Home", callback_data="ui_home")],
+    ])
 
+def help_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="ui_home")]])
 
+async def show_home(update, context):
+    user = update.effective_user
+    lang = get_user_language(user.id) if user else "en"
+    reset_modes(context)
+    text = ("🤖 *ASSISTANT BOT-এ স্বাগতম!* 🚀\n\nআপনার All-in-One Telegram Utility Bot।\n\n📥 Downloader\n📷 QR Scanner\n🔲 QR Generator\n📊 Personal Statistics\n⚙️ Settings\n❓ Help\n\nনিচের Menu থেকে একটি অপশন নির্বাচন করুন।") if lang == "bn" else ("🤖 *Welcome to ASSISTANT BOT!* 🚀\n\nYour All-in-One Telegram Utility Bot.\n\n📥 Downloader\n📷 QR Scanner\n🔲 QR Generator\n📊 Personal Statistics\n⚙️ Settings\n❓ Help\n\nChoose an option from the menu below.")
+    await update.effective_message.reply_text(text, reply_markup=get_main_keyboard(lang), parse_mode="Markdown")
+
+async def ui_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+    if query.data == "ui_home":
+        await show_home(update, context)
+    elif query.data == "ui_tiktok":
+        reset_modes(context)
+        context.user_data["tiktok_mode"] = True
+        await query.message.reply_text(
+            "🎵 *TIKTOK DOWNLOADER*\n\n🔗 Send me a TikTok video link.\n\nI will check the available video qualities and let you choose one.",
+            reply_markup=get_main_keyboard(get_user_language(user.id)),
+            parse_mode="Markdown"
+        )
+    elif query.data in {"lang_bn", "lang_en"}:
+        lang = "bn" if query.data == "lang_bn" else "en"
+        set_user_language(user.id, lang)
+        await query.message.reply_text("✅ ভাষা বাংলা করা হয়েছে।" if lang == "bn" else "✅ Language changed to English.", reply_markup=get_main_keyboard(lang))
+
+async def settings_command(update, context):
+    await update.effective_message.reply_text("⚙️ *Settings*\n\nChoose your language:", reply_markup=settings_keyboard(), parse_mode="Markdown")
+
+async def help_command(update, context):
+    await update.effective_message.reply_text("❓ *Help*\n\n📥 Downloader: choose a downloader and send a supported link.\n📷 QR Scanner: select it, then send a QR image.\n🔲 QR Generator: select it, then send text/link.\n⚙️ Settings: change language.", reply_markup=help_keyboard(), parse_mode="Markdown")
+
+async def ui_text_action(update, context, text):
+    user = update.effective_user
+    lang = get_user_language(user.id)
+    if text == "📥 Downloader":
+        reset_modes(context)
+        await update.message.reply_text("📥 *Downloader*\n\nChoose a downloader:", reply_markup=downloader_keyboard(), parse_mode="Markdown")
+        return True
+    if text == "📷 QR Scanner":
+        await qr_scanner_start(update, context); return True
+    if text == "🔲 QR Generator":
+        await qr_generator_start(update, context); return True
+    if text == "📊 My Stats":
+        messages, scans, generated, downloads = get_user_stats(user.id)
+        msg = f"📊 *My Statistics*\n\n💬 Messages: *{messages}*\n📷 QR Scans: *{scans}*\n🔲 QR Generated: *{generated}*\n🎵 TikTok Downloads: *{downloads}*"
+        await update.message.reply_text(msg, reply_markup=get_main_keyboard(lang), parse_mode="Markdown"); return True
+    if text == "⚙️ Settings":
+        await settings_command(update, context); return True
+    if text == "❓ Help":
+        await help_command(update, context); return True
+    return False
 
 def make_progress_bar(percent: int, width: int = 10) -> str:
     percent = max(0, min(100, int(percent)))
@@ -252,42 +334,10 @@ def reset_modes(context):
 # START
 # ==================================================
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    # Turn off all modes
-    reset_modes(context)
-
-    start_text = """
-🤖 **Welcome to ASSISTANT BOT!**
-
-Your smart all-in-one Telegram assistant 🚀
-
-✨ **Available Tools:**
-
-📷 **QR Code Scanner** — Scan and read QR codes instantly
-
-🔲 **QR Code Generator** — Create QR codes from text or links
-
-🎵 **TikTok Downloader** — Download TikTok videos from links
-
-🛠️ **More Tools** — More useful features coming soon!
-
-👇 **Choose an option below to get started:**
-
-⚡ Fast • Simple • Easy to Use
-"""
-
-    await update.message.reply_text(
-        start_text,
-        reply_markup=get_main_keyboard(),
-        parse_mode="Markdown"
-    )
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_home(update, context)
 
 
-# ==================================================
 # QR CODE SCANNER BUTTON
 # ==================================================
 
@@ -1086,6 +1136,9 @@ async def handle_text(
 
     text = update.message.text.strip()
 
+    if await ui_text_action(update, context, text):
+        return
+
     # ==========================================
     # QR SCANNER BUTTON
     # ==========================================
@@ -1227,6 +1280,9 @@ def main():
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CommandHandler("settings", settings_command))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CallbackQueryHandler(ui_callback, pattern=r"^(ui_|lang_)"))
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin_"))
 
     # ==========================================

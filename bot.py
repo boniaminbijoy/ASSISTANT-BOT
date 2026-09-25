@@ -674,15 +674,28 @@ async def handle_tiktok_link(
 
     except Exception as e:
 
-        print(
-            "TikTok Info Error:",
-            e
-        )
+        error_text = str(e).strip()
+        print("TikTok Info Error:", repr(e))
+
+        # Keep the Telegram message useful without dumping a huge traceback.
+        if "IP address is blocked" in error_text:
+            user_error = (
+                "TikTok is blocking the server IP. "
+                "A fresh TikTok cookies file or a different outbound IP is required."
+            )
+        elif "impersonat" in error_text.lower() or "curl_cffi" in error_text.lower():
+            user_error = (
+                "TikTok browser impersonation is unavailable. "
+                "Install the updated requirements and redeploy."
+            )
+        elif error_text:
+            user_error = error_text[:700]
+        else:
+            user_error = "Unknown yt-dlp error."
 
         await checking_message.edit_text(
             "❌ **Could not process this TikTok link.**\n\n"
-            "💡 Make sure the video is public and "
-            "the link is correct.",
+            f"**Error:** `{user_error}`",
             parse_mode="Markdown"
         )
 

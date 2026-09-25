@@ -26,7 +26,6 @@ from telegram.ext import (
 
 from qr_scanner import scan_qr
 from qr_generator import generate_qr
-from ai_label_remover import remove_ai_label
 
 from tiktok_downloader import (
     get_video_info,
@@ -117,6 +116,11 @@ def init_database():
         conn.execute("""CREATE TABLE IF NOT EXISTS error_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, error_type TEXT,
             error_text TEXT, created_at TEXT NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS more_bots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+            added_by INTEGER NOT NULL, created_at TEXT NOT NULL, enabled INTEGER DEFAULT 1
         )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS support_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
@@ -295,6 +299,98 @@ def is_admin(user_id):
     except sqlite3.Error:
         return False
 
+def get_more_bots(enabled_only=True):
+    with db_connect() as conn:
+        if enabled_only:
+            return conn.execute("SELECT id, username, name, description, enabled FROM more_bots WHERE enabled=1 ORDER BY id DESC").fetchall()
+        return conn.execute("SELECT id, username, name, description, enabled FROM more_bots ORDER BY id DESC").fetchall()
+
+def add_more_bot(username, name, description, added_by):
+    username = username.strip().lstrip('@')
+    with db_connect() as conn:
+        conn.execute("INSERT INTO more_bots(username,name,description,added_by,created_at,enabled) VALUES(?,?,?,?,?,1) ON CONFLICT(username) DO UPDATE SET name=excluded.name, description=excluded.description, added_by=excluded.added_by, enabled=1", (username, name.strip()[:100], description.strip()[:1000], added_by, utc_now()))
+        conn.commit()
+
+def delete_more_bot(bot_id):
+    with db_connect() as conn:
+        cur=conn.execute("DELETE FROM more_bots WHERE id=?", (bot_id,))
+        conn.commit()
+        return cur.rowcount > 0
+
+def more_bots_keyboard():
+    rows=get_more_bots(True)
+    buttons=[]
+    for bot_id, username, name, desc, enabled in rows:
+        buttons.append([InlineKeyboardButton(f"🤖 {name}", callback_data=f"morebot_view_{bot_id}")])
+    buttons.append([InlineKeyboardButton("🏠 Home", callback_data="ui_home")])
+    return InlineKeyboardMarkup(buttons)
+
+async def more_bots_command(update, context):
+    rows=get_more_bots(True)
+    if not rows:
+        await update.effective_message.reply_text("🤖 <b>MORE BOTS</b>\n\nNo additional bots are available right now.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="ui_home")]]))
+        return
+    lines=["🤖 <b>MORE BOTS</b>", "", "✨ Explore more useful bots from the admin's collection.", "", "👇 Select a bot to see its description:"]
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=more_bots_keyboard())
+
+async def addbot_command(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Admin only.")
+        return
+    raw=update.message.text.partition(' ')[2].strip()
+    parts=[x.strip() for x in raw.split('|', 2)]
+    if len(parts) < 3 or not parts[0] or not parts[1] or not parts[2]:
+        await update.effective_message.reply_text("🧩 <b>ADD MORE BOT</b>\n\nUsage:\n<code>/addbot @BotUsername | Bot Name | Description</code>\n\nExample:\n<code>/addbot @ExampleBot | Example Bot | A useful utility bot.</code>", parse_mode="HTML")
+        return
+    username=parts[0].lstrip('@')
+    if not username.replace('_','').isalnum() or len(username) < 5 or len(username) > 32:
+        await update.effective_message.reply_text("❌ Invalid bot username.")
+        return
+    add_more_bot(username, parts[1], parts[2], update.effective_user.id)
+    await update.effective_message.reply_text(f"✅ <b>Bot added to More Bots</b>\n\n🤖 @{html.escape(username)}\n🏷️ {html.escape(parts[1])}\n📝 {html.escape(parts[2])}", parse_mode="HTML", reply_markup=admin_keyboard())
+
+async def bots_command(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Admin only.")
+        return
+    rows=get_more_bots(False)
+    if not rows:
+        await update.effective_message.reply_text("🤖 <b>MORE BOTS MANAGER</b>\n\nNo bots added yet.", parse_mode="HTML", reply_markup=admin_keyboard())
+        return
+    lines=["🤖 <b>MORE BOTS MANAGER</b>", ""]
+    buttons=[]
+    for bot_id, username, name, desc, enabled in rows:
+        state='🟢' if enabled else '🔴'
+        lines.append(f"{state} <b>{html.escape(name)}</b> — @{html.escape(username)}\n   {html.escape(desc[:180])}")
+        buttons.append([InlineKeyboardButton(f"🗑️ Remove {name[:25]}", callback_data=f"morebot_delete_{bot_id}")])
+    buttons.append([InlineKeyboardButton("🏠 Admin Panel", callback_data="admin_panel_home")])
+    await update.effective_message.reply_text("\n\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
+
+async def morebot_callback(update, context):
+    query=update.callback_query
+    await query.answer()
+    try: bot_id=int(query.data.rsplit('_',1)[1])
+    except (ValueError, IndexError): return
+    with db_connect() as conn:
+        row=conn.execute("SELECT id,username,name,description,enabled FROM more_bots WHERE id=?", (bot_id,)).fetchone()
+    if not row:
+        await query.edit_message_text("❌ This bot is no longer available.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🤖 More Bots", callback_data="more_bots")],[InlineKeyboardButton("🏠 Home", callback_data="ui_home")]]))
+        return
+    _, username, name, description, enabled=row
+    if query.data.startswith('morebot_delete_'):
+        if not is_admin(query.from_user.id):
+            await query.edit_message_text("⛔ Admin only.")
+            return
+        delete_more_bot(bot_id)
+        await query.edit_message_text("🗑️ <b>Bot removed.</b>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🤖 Manage More Bots", callback_data="admin_more_bots")],[InlineKeyboardButton("🏠 Admin Panel", callback_data="admin_panel_home")]]))
+        return
+    text=(f"🤖 <b>{html.escape(name)}</b>\n\n"
+          f"📝 <b>Description</b>\n{html.escape(description)}\n\n"
+          f"🔗 <b>@{html.escape(username)}</b>\n\n"
+          "✨ Tap below to open and use this bot.")
+    kb=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Open Bot", url=f"https://t.me/{username}")], [InlineKeyboardButton("⬅️ More Bots", callback_data="more_bots")], [InlineKeyboardButton("🏠 Home", callback_data="ui_home")]])
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+
 def admin_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Dashboard", callback_data="admin_dashboard"), InlineKeyboardButton("👥 Users", callback_data="admin_users")],
@@ -303,8 +399,8 @@ def admin_keyboard():
         [InlineKeyboardButton("📣 Announcement", callback_data="admin_announce"), InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings")],
         [InlineKeyboardButton(f"🔧 M:{'ON' if maintenance_enabled() else 'OFF'}", callback_data="set_maintenance_toggle"), InlineKeyboardButton(f"🎵 D:{'ON' if feature_enabled('downloader') else 'OFF'}", callback_data="set_downloader_toggle")],
         [InlineKeyboardButton(f"📷 S:{'ON' if feature_enabled('qr_scanner') else 'OFF'}", callback_data="set_scanner_toggle"), InlineKeyboardButton(f"🔲 G:{'ON' if feature_enabled('qr_generator') else 'OFF'}", callback_data="set_generator_toggle")],
-        [InlineKeyboardButton(f"🪄 AI:{'ON' if feature_enabled('ai_label_remover') else 'OFF'}", callback_data="set_ai_label_toggle")],
         [InlineKeyboardButton("🧪 System Status", callback_data="admin_status")],
+        [InlineKeyboardButton("🤖 More Bots Manager", callback_data="admin_more_bots")],
         [InlineKeyboardButton("🏠 Home", callback_data="ui_home")],
     ])
 
@@ -753,7 +849,7 @@ async def status_callback(update, context):
     ]
     features = [
         ('📥 Downloader', feature_enabled('downloader')), ('📷 QR Scanner', feature_enabled('qr_scanner')),
-        ('🔲 QR Generator', feature_enabled('qr_generator')), ('🪄 AI Label Remover', feature_enabled('ai_label_remover')), ('🆘 User Support', True),
+        ('🔲 QR Generator', feature_enabled('qr_generator')), ('🆘 User Support', True),
         ('📢 Broadcast', True), ('⏰ Scheduled Broadcast', True), ('🚨 Error Monitoring', True),
         ('🛡️ Admin Commands', True), ('⚙️ Feature Settings', True),
     ]
@@ -766,13 +862,12 @@ async def status_callback(update, context):
 
 async def settings_admin_callback(update, context):
     q=update.callback_query
-    lines=['⚙️ *BOT SETTINGS*\n',f"🔧 Maintenance: *{'ON' if maintenance_enabled() else 'OFF'}*",f"🎵 Downloader: *{'ON' if feature_enabled('downloader') else 'OFF'}*",f"📷 QR Scanner: *{'ON' if feature_enabled('qr_scanner') else 'OFF'}*",f"🔲 QR Generator: *{'ON' if feature_enabled('qr_generator') else 'OFF'}*",f"🪄 AI Label Remover: *{'ON' if feature_enabled('ai_label_remover') else 'OFF'}*"]
+    lines=['⚙️ *BOT SETTINGS*\n',f"🔧 Maintenance: *{'ON' if maintenance_enabled() else 'OFF'}*",f"🎵 Downloader: *{'ON' if feature_enabled('downloader') else 'OFF'}*",f"📷 QR Scanner: *{'ON' if feature_enabled('qr_scanner') else 'OFF'}*",f"🔲 QR Generator: *{'ON' if feature_enabled('qr_generator') else 'OFF'}*"]
     kb=InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🔧 Maintenance: {'ON' if maintenance_enabled() else 'OFF'}",callback_data='set_maintenance_toggle')],
         [InlineKeyboardButton(f"🎵 Downloader: {'ON' if feature_enabled('downloader') else 'OFF'}",callback_data='set_downloader_toggle')],
         [InlineKeyboardButton(f"📷 Scanner: {'ON' if feature_enabled('qr_scanner') else 'OFF'}",callback_data='set_scanner_toggle')],
         [InlineKeyboardButton(f"🔲 Generator: {'ON' if feature_enabled('qr_generator') else 'OFF'}",callback_data='set_generator_toggle')],
-        [InlineKeyboardButton(f"🪄 AI Label Remover: {'ON' if feature_enabled('ai_label_remover') else 'OFF'}",callback_data='set_ai_label_toggle')],
         [InlineKeyboardButton('🏠 Admin Panel',callback_data='admin_panel_home')]
     ])
     await q.edit_message_text('\n'.join(lines),parse_mode='Markdown',reply_markup=kb)
@@ -891,9 +986,20 @@ async def admin_callback(update, context):
     elif d=='admin_announce': await query.edit_message_text('📣 *ADMIN ANNOUNCEMENT*\n\n/announce <message>',parse_mode='Markdown',reply_markup=admin_keyboard())
     elif d=='admin_settings': await settings_admin_callback(update, context)
     elif d=='admin_status': await status_callback(update, context)
+    elif d=='admin_more_bots':
+        await query.edit_message_text('🤖 <b>MORE BOTS MANAGER</b>\n\n/addbot @username | Bot Name | Description\n/bots — view and remove added bots\n\nOnly administrators can manage this list.', parse_mode='HTML', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('📋 View Added Bots', callback_data='admin_more_bots_list')],[InlineKeyboardButton('🏠 Admin Panel', callback_data='admin_panel_home')]]))
+    elif d=='admin_more_bots_list':
+        rows=get_more_bots(False)
+        buttons=[]
+        lines=['🤖 <b>MORE BOTS</b>\n']
+        for bot_id,username,name,desc,enabled in rows:
+            lines.append(f"{'🟢' if enabled else '🔴'} <b>{html.escape(name)}</b> — @{html.escape(username)}")
+            buttons.append([InlineKeyboardButton(f'🗑️ Remove {name[:25]}', callback_data=f'morebot_delete_{bot_id}')])
+        buttons.append([InlineKeyboardButton('🏠 Admin Panel', callback_data='admin_panel_home')])
+        await query.edit_message_text('\n'.join(lines) if rows else '🤖 <b>MORE BOTS</b>\n\nNo bots added yet.', parse_mode='HTML', reply_markup=InlineKeyboardMarkup(buttons))
     elif d=='admin_panel_home': await query.edit_message_text('🛠️ *ADVANCED ADMIN PANEL*\n\nChoose an option:',parse_mode='Markdown',reply_markup=admin_keyboard())
-    elif d in {'set_maintenance_toggle','set_downloader_toggle','set_scanner_toggle','set_generator_toggle','set_ai_label_toggle'}:
-        keymap={'set_maintenance_toggle':'maintenance','set_downloader_toggle':'downloader','set_scanner_toggle':'qr_scanner','set_generator_toggle':'qr_generator','set_ai_label_toggle':'ai_label_remover'}
+    elif d in {'set_maintenance_toggle','set_downloader_toggle','set_scanner_toggle','set_generator_toggle'}:
+        keymap={'set_maintenance_toggle':'maintenance','set_downloader_toggle':'downloader','set_scanner_toggle':'qr_scanner','set_generator_toggle':'qr_generator'}
         key=keymap[d]
         if key=='maintenance': set_maintenance(not maintenance_enabled())
         else: set_setting(key,'0' if feature_enabled(key) else '1')
@@ -1062,7 +1168,8 @@ def get_main_keyboard(language="en", is_admin_user=False):
     keyboard = [
         ["📥 Downloader", "📷 QR Scanner"],
         ["🔲 QR Generator", "📊 My Stats"],
-        ["🪄 AI Label Remover", "👤 My Profile"],
+        ["👤 My Profile"],
+        ["🤖 More Bots"],
         ["🕘 My History", "⚙️ Settings"],
         ["❓ Help"],
     ]
@@ -1231,7 +1338,7 @@ async def settings_command(update, context):
     await update.effective_message.reply_text("⚙️ *Settings*\n\nChoose your language:", reply_markup=settings_keyboard(), parse_mode="Markdown")
 
 async def help_command(update, context):
-    await update.effective_message.reply_text("❓ *Help*\n\n📥 Downloader: choose a downloader and send a supported link.\n📷 QR Scanner: select it, then send a QR image.\n🔲 QR Generator: select it, then send text/link.\n⚙️ Settings: change language.", reply_markup=help_keyboard(), parse_mode="Markdown")
+    await update.effective_message.reply_text("❓ *Help*\n\n📥 Downloader: choose a downloader and send a supported link.\n📷 QR Scanner: select it, then send a QR image.\n🔲 QR Generator: select it, then send text/link.\n🤖 More Bots: discover other bots added by the admin.\n⚙️ Settings: change language.", reply_markup=help_keyboard(), parse_mode="Markdown")
 
 async def ui_text_action(update, context, text):
     user = update.effective_user
@@ -1244,14 +1351,14 @@ async def ui_text_action(update, context, text):
         await qr_scanner_start(update, context); return True
     if text == "🔲 QR Generator":
         await qr_generator_start(update, context); return True
-    if text == "🪄 AI Label Remover":
-        await ai_label_remover_start(update, context); return True
     if text == "📊 My Stats":
         messages, scans, generated, downloads = get_user_stats(user.id)
         msg = f"📊 *My Statistics*\n\n💬 Messages: *{messages}*\n📷 QR Scans: *{scans}*\n🔲 QR Generated: *{generated}*\n🎵 TikTok Downloads: *{downloads}*"
         await update.message.reply_text(msg, reply_markup=get_main_keyboard(lang, is_admin(user.id)), parse_mode="Markdown"); return True
     if text == "👤 My Profile":
         await user_profile_command(update, context); return True
+    if text == "🤖 More Bots":
+        await more_bots_command(update, context); return True
     if text == "🕘 My History":
         await user_features_command(update, context); return True
     if text == "⚙️ Settings":
@@ -1277,7 +1384,6 @@ def reset_modes(context):
 
     context.user_data["qr_generator_mode"] = False
     context.user_data["qr_generator_data"] = None
-    context.user_data["ai_label_remover_mode"] = False
 
     context.user_data["tiktok_mode"] = False
     context.user_data["tiktok_url"] = None
@@ -1294,55 +1400,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # QR CODE SCANNER BUTTON
 # ==================================================
-
-async def ai_label_remover_start(update, context):
-    if not feature_enabled('ai_label_remover') and not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text('🪄 AI Label Remover is temporarily disabled by Admin.')
-        return
-    reset_modes(context)
-    context.user_data["ai_label_remover_mode"] = True
-    lang = get_user_language(update.effective_user.id)
-    text = (
-        "🪄 *AI Label Remover*\n\nSend an image. I will process it and return a cleaned copy.\n\nYou can send another image immediately after the result — the tool stays active.\n\nSend /start to exit."
-        if lang != 'bn' else
-        "🪄 *AI Label Remover*\n\nএকটি ছবি পাঠান। আমি সেটি প্রসেস করে cleaned copy ফেরত দেব।\n\nফলাফল পাওয়ার পর আবার ছবি পাঠালেই নতুন কাজ শুরু হবে।\n\nবন্ধ করতে /start দিন।"
-    )
-    await update.effective_message.reply_text(text, parse_mode='Markdown')
-
-async def handle_ai_label_image(update, context):
-    if not context.user_data.get('ai_label_remover_mode', False):
-        return False
-    if not feature_enabled('ai_label_remover') and not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text('🪄 AI Label Remover is temporarily disabled by Admin.')
-        return True
-    user_id = update.effective_user.id
-    status = await update.effective_message.reply_text('🪄 *Processing image...*\n\n`░░░░░░░░░░` **0%**', parse_mode='Markdown')
-    temp_dir = tempfile.mkdtemp(prefix=f"ai_label_{user_id}_")
-    src = os.path.join(temp_dir, f"input_{uuid.uuid4().hex}.jpg")
-    out = os.path.join(temp_dir, f"clean_{uuid.uuid4().hex}.jpg")
-    try:
-        media = update.message.photo[-1] if update.message.photo else update.message.document
-        f = await context.bot.get_file(media.file_id)
-        await f.download_to_drive(src)
-        await status.edit_text('🪄 *Processing image...*\n\n`█████░░░░░` **50%**', parse_mode='Markdown')
-        changed = await asyncio.to_thread(remove_ai_label, src, out)
-        await status.edit_text('🪄 *Finalizing...*\n\n`██████████` **100%**', parse_mode='Markdown')
-        caption = '✅ Clean image ready.\n\n🪄 Send another image to process again.' if changed else '✅ Image processed. No clear label region was detected, so the original image was kept.\n\n🪄 Send another image to process again.'
-        with open(out, 'rb') as fh:
-            await update.effective_message.reply_photo(photo=fh, caption=caption)
-        log_activity(user_id, 'ai_label_remove', 'changed' if changed else 'no_change')
-    except Exception as exc:
-        await status.edit_text(f'❌ *Processing failed*\n\n`{html.escape(type(exc).__name__ + ": " + str(exc)[:300])}`', parse_mode='Markdown')
-    finally:
-        try:
-            for p in (src, out):
-                if os.path.exists(p): os.remove(p)
-            os.rmdir(temp_dir)
-        except OSError:
-            pass
-    # Deliberately keep ai_label_remover_mode=True so the next image starts immediately.
-    raise ApplicationHandlerStop
-    return True
 
 async def qr_scanner_start(
     update: Update,
@@ -1494,7 +1551,6 @@ async def qr_generator_start(
     context.user_data["qr_generator_mode"] = True
 
     context.user_data["qr_generator_data"] = None
-    context.user_data["ai_label_remover_mode"] = False
 
     await update.message.reply_text(
         "🔳 **QR CODE GENERATOR**\n\n"
@@ -1653,7 +1709,6 @@ async def handle_qr_generator_text(
         except OSError:
             pass
         context.user_data["qr_generator_data"] = None
-    context.user_data["ai_label_remover_mode"] = False
 
 
 # ==================================================
@@ -2343,8 +2398,12 @@ def main():
     app.add_handler(CommandHandler("profile", user_profile_command))
     app.add_handler(CommandHandler("mystats", user_stats_view))
     app.add_handler(CommandHandler("history", user_features_command))
+    app.add_handler(CommandHandler("morebots", more_bots_command))
+    app.add_handler(CommandHandler("addbot", addbot_command))
+    app.add_handler(CommandHandler("bots", bots_command))
     app.add_handler(CallbackQueryHandler(ui_callback, pattern=r"^(ui_|lang_|user_profile$|user_stats$|hist_(downloads|scans|generates|activity)$)"))
     app.add_handler(CallbackQueryHandler(admin_help_callback, pattern=r"^admin_help_[123]$"))
+    app.add_handler(CallbackQueryHandler(morebot_callback, pattern=r"^morebot_(view|delete)_\d+$|^more_bots$"))
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^(admin_|set_)"))
 
     # ==========================================
@@ -2376,13 +2435,6 @@ def main():
     app.add_handler(
         MessageHandler(
             filters.PHOTO | filters.Document.IMAGE,
-            handle_ai_label_image,
-            block=False
-        )
-    )
-    app.add_handler(
-        MessageHandler(
-            filters.PHOTO | filters.Document.IMAGE,
             handle_qr_image
         )
     )
@@ -2401,11 +2453,19 @@ def main():
     app.add_error_handler(error_monitor)
     # Automatic command menu: users do not need /start to discover the latest commands.
     async def post_init(application):
-        await application.bot.set_my_commands([
-            ("start", "Open main menu"), ("help", "Help"), ("profile", "My Profile"),
-            ("mystats", "My Statistics"), ("history", "My History"), ("settings", "Settings"),
-            ("support", "Contact Admin"), ("status", "Admin system status")
-        ])
+        from telegram import BotCommand, BotCommandScopeChat
+        default_commands = [
+            BotCommand("start", "Open main menu"), BotCommand("help", "Help"), BotCommand("profile", "My Profile"),
+            BotCommand("mystats", "My Statistics"), BotCommand("history", "My History"), BotCommand("settings", "Settings"),
+            BotCommand("support", "Contact Admin"), BotCommand("morebots", "More Bots")
+        ]
+        await application.bot.set_my_commands(default_commands)
+        admin_commands = default_commands + [BotCommand("admin", "Admin Panel"), BotCommand("status", "Admin system status"), BotCommand("addbot", "Add More Bot"), BotCommand("bots", "Manage More Bots")]
+        for aid in ADMIN_IDS:
+            try:
+                await application.bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=aid))
+            except Exception:
+                pass
         if application.job_queue:
             # Restore pending schedules after a Render restart.
             with db_connect() as conn:

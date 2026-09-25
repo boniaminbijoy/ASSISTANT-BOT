@@ -1,6 +1,7 @@
 import os
 import shutil
 import yt_dlp
+from yt_dlp.networking.impersonate import ImpersonateTarget
 
 
 TIKTOK_USER_AGENT = os.environ.get(
@@ -36,7 +37,7 @@ def _base_options():
     # If the target is unavailable, yt-dlp will raise a clear error rather
     # than silently pretending the extraction succeeded.
     if TIKTOK_IMPERSONATE:
-        options["impersonate"] = TIKTOK_IMPERSONATE
+        options["impersonate"] = ImpersonateTarget.from_str(TIKTOK_IMPERSONATE.lower())
 
     # On some server IPs TikTok blocks anonymous extraction. A Netscape
     # cookies file from a TikTok session can be supplied through Render as

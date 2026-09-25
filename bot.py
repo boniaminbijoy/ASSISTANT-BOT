@@ -195,7 +195,12 @@ async def handle_qr_image(
 
     def qr_progress(percent):
         percent = int(percent)
-        if percent != 100 and percent - progress_state["last"] < 5:
+        # 100% is handled by handle_qr_image itself. Scheduling a 100% edit
+        # from the worker thread can race with the final result edit and
+        # overwrite the decoded QR result.
+        if percent >= 100:
+            return
+        if percent - progress_state["last"] < 5:
             return
         progress_state["last"] = percent
         stage = "🔎 Scanning image..." if percent < 70 else "🧩 Checking QR patterns..."
@@ -238,7 +243,7 @@ async def handle_qr_image(
             lines = []
             for index, result in enumerate(results, 1):
                 safe = html.escape(result)
-                lines.append(f"**{index}.** <code>{safe}</code>")
+                lines.append(f"<b>{index}.</b> <code>{safe}</code>")
 
             await detecting_message.edit_text(
                 "✅ <b>QR CODE DETECTED!</b>\n\n"
@@ -1059,6 +1064,16 @@ async def handle_text(
 # MAIN
 # ==================================================
 
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Log unexpected bot errors without leaving them as unhandled exceptions."""
+    error = context.error
+    print("Unhandled bot error:", repr(error))
+
+    # Telegram polling conflicts are caused by another process using the same
+    # bot token. Do not attempt to hide or auto-retry this condition here.
+    # The deployment must have exactly one polling instance.
+
+
 def main():
 
     app = (
@@ -1071,6 +1086,8 @@ def main():
     # ==========================================
     # /start
     # ==========================================
+
+    app.add_error_handler(global_error_handler)
 
     app.add_handler(
         CommandHandler(

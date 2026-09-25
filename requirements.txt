@@ -1,6 +1,0 @@
-python-telegram-bot
-Pillow
-opencv-python-headless
-qrcode
-pyzbar
-yt-dlp

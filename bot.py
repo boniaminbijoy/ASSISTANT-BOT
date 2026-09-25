@@ -19,7 +19,7 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     ContextTypes,
-    filters, CallbackQueryHandler
+    filters, CallbackQueryHandler, ApplicationHandlerStop
 )
 
 from qr_scanner import scan_qr
@@ -96,6 +96,11 @@ def init_database():
         conn.execute("""CREATE TABLE IF NOT EXISTS bot_settings (
             key TEXT PRIMARY KEY, value TEXT NOT NULL
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS admins (
+            user_id INTEGER PRIMARY KEY, added_by INTEGER, created_at TEXT NOT NULL
+        )""")
+        for admin_id in ADMIN_IDS:
+            conn.execute("INSERT OR IGNORE INTO admins(user_id, added_by, created_at) VALUES(?,?,?)", (admin_id, admin_id, utc_now()))
         conn.execute("""CREATE TABLE IF NOT EXISTS broadcast_reports (
             id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER NOT NULL,
             kind TEXT NOT NULL, target_count INTEGER DEFAULT 0, sent INTEGER DEFAULT 0,
@@ -223,8 +228,9 @@ def search_users(term, limit=10):
 
 def set_blocked(user_id, blocked):
     with db_connect() as conn:
-        conn.execute("UPDATE users SET is_blocked=? WHERE user_id=?", (1 if blocked else 0, user_id))
+        cur = conn.execute("UPDATE users SET is_blocked=? WHERE user_id=?", (1 if blocked else 0, user_id))
         conn.commit()
+        return cur.rowcount > 0
 
 def maintenance_enabled():
     with db_connect() as conn:
@@ -242,7 +248,14 @@ def save_broadcast_report(admin_id, kind, target, sent, failed, blocked):
         conn.commit()
 
 def is_admin(user_id):
-    return user_id in ADMIN_IDS
+    if user_id in ADMIN_IDS:
+        return True
+    try:
+        with db_connect() as conn:
+            row = conn.execute("SELECT 1 FROM admins WHERE user_id=? LIMIT 1", (user_id,)).fetchone()
+        return bool(row)
+    except sqlite3.Error:
+        return False
 
 def admin_keyboard():
     return InlineKeyboardMarkup([
@@ -304,18 +317,184 @@ async def searchuser_command(update, context):
     await update.effective_message.reply_text("\n".join(lines)+"\n\nUse /user <id> for details.", parse_mode="Markdown")
 
 async def block_command(update, context):
-    if not is_admin(update.effective_user.id): await update.effective_message.reply_text("⛔ Admin only."); return
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Admin only.")
+        return
     arg=update.message.text.partition(' ')[2].strip()
-    if not arg.isdigit(): await update.effective_message.reply_text("Usage: /block <telegram_id>"); return
-    set_blocked(int(arg), True); log_activity(update.effective_user.id,"admin_block",arg)
-    await update.effective_message.reply_text(f"🚫 User `{arg}` blocked.", parse_mode="Markdown")
+    if not arg.isdigit():
+        await update.effective_message.reply_text("Usage: /block <telegram_id>")
+        return
+    uid=int(arg)
+    if uid in ADMIN_IDS:
+        await update.effective_message.reply_text("⚠️ Admin accounts cannot be blocked.")
+        return
+    if not set_blocked(uid, True):
+        await update.effective_message.reply_text(f"❌ User `{arg}` not found in database.", parse_mode="Markdown")
+        return
+    log_activity(update.effective_user.id,"admin_block",arg)
+    await update.effective_message.reply_text(f"🚫 User `{arg}` blocked successfully.", parse_mode="Markdown")
 
 async def unblock_command(update, context):
-    if not is_admin(update.effective_user.id): await update.effective_message.reply_text("⛔ Admin only."); return
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Admin only.")
+        return
     arg=update.message.text.partition(' ')[2].strip()
-    if not arg.isdigit(): await update.effective_message.reply_text("Usage: /unblock <telegram_id>"); return
-    set_blocked(int(arg), False); log_activity(update.effective_user.id,"admin_unblock",arg)
-    await update.effective_message.reply_text(f"🔓 User `{arg}` unblocked.", parse_mode="Markdown")
+    if not arg.isdigit():
+        await update.effective_message.reply_text("Usage: /unblock <telegram_id>")
+        return
+    uid=int(arg)
+    if not set_blocked(uid, False):
+        await update.effective_message.reply_text(f"❌ User `{arg}` not found in database.", parse_mode="Markdown")
+        return
+    log_activity(update.effective_user.id,"admin_unblock",arg)
+    await update.effective_message.reply_text(f"🔓 User `{arg}` unblocked successfully.", parse_mode="Markdown")
+
+# Friendly aliases for the same user-control system.
+async def ban_command(update, context):
+    await block_command(update, context)
+
+async def unban_command(update, context):
+    await unblock_command(update, context)
+
+
+async def admin_list_command(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Admin only.")
+        return
+    with db_connect() as conn:
+        rows = conn.execute("SELECT user_id, added_by, created_at FROM admins ORDER BY user_id").fetchall()
+    lines = ["👑 *ADMIN LIST*\n"]
+    for uid, added_by, created in rows:
+        source = "ENV" if uid in ADMIN_IDS else f"Added by `{added_by}`"
+        lines.append(f"• `{uid}` — {source}")
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=admin_keyboard())
+
+async def add_admin_command(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Admin only.")
+        return
+    arg = update.effective_message.text.partition(' ')[2].strip()
+    if not arg.isdigit():
+        await update.effective_message.reply_text("Usage: /addadmin <telegram_id>")
+        return
+    uid = int(arg)
+    if is_admin(uid):
+        await update.effective_message.reply_text(f"ℹ️ `{uid}` is already an admin.", parse_mode="Markdown")
+        return
+    with db_connect() as conn:
+        conn.execute("INSERT OR IGNORE INTO admins(user_id, added_by, created_at) VALUES(?,?,?)", (uid, update.effective_user.id, utc_now()))
+        conn.commit()
+    await update.effective_message.reply_text(f"✅ Admin added successfully.\n\n🆔 `{uid}`", parse_mode="Markdown")
+
+async def del_admin_command(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Admin only.")
+        return
+    arg = update.effective_message.text.partition(' ')[2].strip()
+    if not arg.isdigit():
+        await update.effective_message.reply_text("Usage: /deladmin <telegram_id>")
+        return
+    uid = int(arg)
+    if uid in ADMIN_IDS:
+        await update.effective_message.reply_text("⚠️ This admin is configured in Render `ADMIN_IDS`. Remove the ID from the Environment Variable to revoke it.")
+        return
+    with db_connect() as conn:
+        cur = conn.execute("DELETE FROM admins WHERE user_id=?", (uid,))
+        conn.commit()
+    if cur.rowcount == 0:
+        await update.effective_message.reply_text("❌ Admin not found.")
+        return
+    await update.effective_message.reply_text(f"✅ Admin removed successfully.\n\n🆔 `{uid}`", parse_mode="Markdown")
+
+async def about_command(update, context):
+    await update.effective_message.reply_text(
+        "🤖 *ASSISTANT BOT*\n\nAll-in-One Telegram Utility Bot.\n\n📥 TikTok Downloader\n📷 QR Scanner\n🔲 QR Generator\n📊 User Statistics\n👤 Profile & History\n🛡️ Advanced Admin Panel",
+        parse_mode="Markdown")
+
+async def support_command(update, context):
+    await update.effective_message.reply_text(
+        "🆘 *SUPPORT*\n\nIf you need help, contact the bot administrator.\n\nUse /myid to see your Telegram ID if the administrator asks for it.",
+        parse_mode="Markdown")
+
+async def helpuser_command(update, context):
+    await update.effective_message.reply_text(
+        "❓ *USER HELP*\n\n/start — Main menu\n/profile — My Profile\n/mystats — My Statistics\n/history — My History\n/settings — Settings\n/id — Your Telegram ID\n/about — About Bot\n/support — Support",
+        parse_mode="Markdown")
+
+async def helpadmin_command(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Admin only.")
+        return
+    await update.effective_message.reply_text(
+        "🛡️ *ADMIN HELP*\n\n"
+        "/admin — Admin Panel\n/dashboard — Dashboard\n/adminlist — Admin List\n/addadmin <id> — Add Admin\n/deladmin <id> — Delete Admin\n"
+        "/activeusers — Active Users (24h)\n/newuser — New Users (today)\n/topuser — Top Users\n/usercount — Total Users\n"
+        "/users — Recent Users\n/searchuser <id|username> — Search User\n/user <id> — User Details\n"
+        "/block <id> — Block User\n/unblock <id> — Unblock User\n/ban <id> — Ban User\n/unban <id> — Unban User\n"
+        "/broadcast — Text Broadcast\n/reports — Broadcast Reports\n/maintenance on|off — Maintenance\n/announce <msg> — Announcement\n/restart — Restart Bot\n/ping — Bot Ping",
+        parse_mode="Markdown", reply_markup=admin_keyboard())
+
+async def ping_command(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Admin only.")
+        return
+    start = datetime.now(timezone.utc)
+    msg = await update.effective_message.reply_text("🏓 Pinging...")
+    ms = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
+    await msg.edit_text(f"🏓 *PONG*\n\n⚡ Response: `{ms} ms`\n🟢 Bot is online.", parse_mode="Markdown")
+
+async def activeusers_command(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Admin only.")
+        return
+    with db_connect() as conn:
+        rows = conn.execute("SELECT user_id, username, first_name, last_seen FROM users WHERE last_seen >= ? ORDER BY last_seen DESC LIMIT 50", ((datetime.now(timezone.utc)-timedelta(days=1)).isoformat(timespec='seconds'),)).fetchall()
+    lines = [f"🟢 *ACTIVE USERS (24H)* — {len(rows)}\n"]
+    for uid, un, name, last in rows:
+        lines.append(f"• `{uid}` {('@'+un) if un else (name or 'User')} — {format_dt(last)}")
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=admin_keyboard())
+
+async def newuser_command(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Admin only.")
+        return
+    today = datetime.now(timezone.utc).date().isoformat()
+    with db_connect() as conn:
+        rows = conn.execute("SELECT user_id, username, first_name, joined_at FROM users WHERE substr(joined_at,1,10)=? ORDER BY joined_at DESC LIMIT 50", (today,)).fetchall()
+    lines = [f"🆕 *NEW USERS (TODAY)* — {len(rows)}\n"]
+    for uid, un, name, joined in rows:
+        lines.append(f"• `{uid}` {('@'+un) if un else (name or 'User')} — {format_dt(joined)}")
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=admin_keyboard())
+
+async def topuser_command(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Admin only.")
+        return
+    with db_connect() as conn:
+        rows = conn.execute("SELECT user_id, username, first_name, messages, tiktok_downloads, qr_scans, qr_generated FROM users ORDER BY (messages + tiktok_downloads + qr_scans + qr_generated) DESC LIMIT 20").fetchall()
+    lines = ["🏆 *TOP USERS*\n"]
+    for i, (uid, un, name, messages, dl, scans, gen) in enumerate(rows, 1):
+        total = messages + dl + scans + gen
+        lines.append(f"{i}. `{uid}` {('@'+un) if un else (name or 'User')} — {total} activities")
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=admin_keyboard())
+
+async def usercount_command(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Admin only.")
+        return
+    with db_connect() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        blocked = conn.execute("SELECT COUNT(*) FROM users WHERE is_blocked=1").fetchone()[0]
+    await update.effective_message.reply_text(f"👥 *USER COUNT*\n\nTotal Users: *{total}*\n🚫 Blocked: *{blocked}*\n🟢 Active: *{total-blocked}*", parse_mode="Markdown", reply_markup=admin_keyboard())
+
+async def restart_command(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Admin only.")
+        return
+    await update.effective_message.reply_text("♻️ Bot restart requested. Render will restart the service.")
+    await asyncio.sleep(1)
+    # Let the hosting platform manage the process lifecycle; exiting is safer than spawning a second polling instance.
+    os._exit(0)
 
 async def maintenance_command(update, context):
     if not is_admin(update.effective_user.id): await update.effective_message.reply_text("⛔ Admin only."); return
@@ -417,15 +596,31 @@ async def admin_callback(update, context):
     elif d=='admin_announce': await query.edit_message_text('📣 *ADMIN ANNOUNCEMENT*\n\n/announce <message>',parse_mode='Markdown',reply_markup=admin_keyboard())
 
 async def maintenance_guard(update, context):
+    """Hard gate: blocked users and maintenance-mode users must not reach any later handler group."""
     user=update.effective_user
-    if not user or is_admin(user.id) or not maintenance_enabled():
+    if not user:
         return
-    if user and get_user_by_id(user.id) and get_user_by_id(user.id)[9]:
+
+    # Admins always retain access, including while maintenance mode is ON.
+    if is_admin(user.id):
         return
-    msg=update.effective_message
-    if msg:
-        await msg.reply_text("🔧 Bot maintenance mode is ON.\n\nPlease try again later.")
-    raise Exception("MAINTENANCE_BLOCKED")
+
+    row = get_user_by_id(user.id)
+    if row and row[9]:
+        msg=update.effective_message
+        if msg:
+            await msg.reply_text("🚫 You are blocked from using this bot.\n\nPlease contact the administrator.")
+        elif update.callback_query:
+            await update.callback_query.answer("🚫 You are blocked from using this bot.", show_alert=True)
+        raise ApplicationHandlerStop
+
+    if maintenance_enabled():
+        msg=update.effective_message
+        if msg:
+            await msg.reply_text("🔧 Bot maintenance mode is ON.\n\nPlease try again later.")
+        elif update.callback_query:
+            await update.callback_query.answer("🔧 Bot maintenance mode is ON.", show_alert=True)
+        raise ApplicationHandlerStop
 
 async def track_update(update, context):
     if update.effective_user:
@@ -559,13 +754,16 @@ async def user_features_command(update, context):
 # MAIN MENU
 # ==================================================
 
-def get_main_keyboard(language="en"):
+def get_main_keyboard(language="en", is_admin_user=False):
     keyboard = [
         ["📥 Downloader", "📷 QR Scanner"],
         ["🔲 QR Generator", "📊 My Stats"],
         ["👤 My Profile", "🕘 My History"],
         ["⚙️ Settings", "❓ Help"],
     ]
+    # Admin-only button: never show it to normal users.
+    if is_admin_user:
+        keyboard.append(["🛡️ Admin Commands"])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 def downloader_keyboard():
@@ -586,9 +784,10 @@ def help_keyboard():
 async def show_home(update, context):
     user = update.effective_user
     lang = get_user_language(user.id) if user else "en"
+    admin_user = bool(user and is_admin(user.id))
     reset_modes(context)
     text = ("🤖 *ASSISTANT BOT-এ স্বাগতম!* 🚀\n\nআপনার All-in-One Telegram Utility Bot।\n\n📥 Downloader\n📷 QR Scanner\n🔲 QR Generator\n📊 Personal Statistics\n⚙️ Settings\n❓ Help\n\nনিচের Menu থেকে একটি অপশন নির্বাচন করুন।") if lang == "bn" else ("🤖 *Welcome to ASSISTANT BOT!* 🚀\n\nYour All-in-One Telegram Utility Bot.\n\n📥 Downloader\n📷 QR Scanner\n🔲 QR Generator\n📊 Personal Statistics\n⚙️ Settings\n❓ Help\n\nChoose an option from the menu below.")
-    await update.effective_message.reply_text(text, reply_markup=get_main_keyboard(lang), parse_mode="Markdown")
+    await update.effective_message.reply_text(text, reply_markup=get_main_keyboard(lang, admin_user), parse_mode="Markdown")
 
 async def ui_callback(update, context):
     query = update.callback_query
@@ -632,6 +831,98 @@ async def ui_callback(update, context):
         set_user_language(user.id, lang)
         await query.message.reply_text("✅ ভাষা বাংলা করা হয়েছে।" if lang == "bn" else "✅ Language changed to English.", reply_markup=get_main_keyboard(lang))
 
+def admin_help_keyboard(page=1):
+    buttons = []
+    if page > 1:
+        buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"admin_help_{page-1}"))
+    if page < 3:
+        buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"admin_help_{page+1}"))
+    rows = [buttons] if buttons else []
+    rows.append([InlineKeyboardButton("🛠️ Admin Panel", callback_data="admin_dashboard"),
+                 InlineKeyboardButton("🏠 Home", callback_data="ui_home")])
+    return InlineKeyboardMarkup(rows)
+
+ADMIN_HELP_PAGES = {
+    1: (
+        "🛡️ <b>ADMIN COMMANDS — 1/3</b>\n\n"
+        "📊 <b>Dashboard & Statistics</b>\n"
+        "/admin — Open Admin Panel\n"
+        "/stats — Dashboard/statistics overview\n"
+        "/users — Latest users list\n"
+        "/activeusers — Users active in last 24h\n"
+        "/newuser — New users today\n"
+        "/topuser — Most active users\n"
+        "/usercount — Total and blocked user count\n"
+        "/reports — Broadcast delivery reports\n\n"
+        "👥 <b>User Management</b>\n"
+        "/searchuser &lt;id|username&gt; — Search a user\n"
+        "/user &lt;id&gt; — View user details\n\n"
+        "🚫 <b>User Control</b>\n"
+        "/block &lt;id&gt; — Block a user\n"
+        "/unblock &lt;id&gt; — Remove block\n"
+        "/ban &lt;id&gt; — Ban (same block system)\n"
+        "/unban &lt;id&gt; — Remove ban\n"
+    ),
+    2: (
+        "🛡️ <b>ADMIN COMMANDS — 2/3</b>\n\n"
+        "👑 <b>Admin Management</b>\n"
+        "/adminlist — Show admin list\n"
+        "/addadmin &lt;id&gt; — Add an admin\n"
+        "/deladmin &lt;id&gt; — Remove a database admin\n\n"
+        "📢 <b>Broadcast</b>\n"
+        "/broadcast &lt;text&gt; — Text broadcast\n"
+        "/broadcast_media — Broadcast replied photo/video/document\n"
+        "/broadcast_button — Broadcast with URL button\n"
+        "/announce &lt;message&gt; — Send admin announcement\n"
+        "/reports — View recent broadcast reports\n\n"
+        "🔧 <b>Bot Control</b>\n"
+        "/maintenance on|off — Enable/disable maintenance mode\n"
+        "/restart — Restart the Render service process\n"
+        "/ping — Check bot response time\n"
+    ),
+    3: (
+        "🛡️ <b>ADMIN COMMANDS — 3/3</b>\n\n"
+        "ℹ️ <b>Information & Help</b>\n"
+        "/about — Bot information\n"
+        "/support — Support information\n"
+        "/helpuser — Show user commands\n"
+        "/helpadmin — Show admin command list\n"
+        "/id or /myid — Show your Telegram ID\n\n"
+        "📌 <b>Quick Examples</b>\n"
+        "/block 123456789\n"
+        "/unblock 123456789\n"
+        "/user 123456789\n"
+        "/searchuser 123456789\n"
+        "/addadmin 123456789\n"
+        "/maintenance on\n"
+        "/broadcast Hello everyone!\n"
+        "/announce Important notice\n\n"
+        "🔐 <b>Security:</b> These commands are available only to verified admins.\n"
+        "⚠️ Admin IDs configured in Render <code>ADMIN_IDS</code> cannot be removed with /deladmin."
+    ),
+}
+
+async def admin_help_button(update, context):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await update.effective_message.reply_text("⛔ Admin only.")
+        return True
+    await update.effective_message.reply_text(ADMIN_HELP_PAGES[1], parse_mode="HTML", reply_markup=admin_help_keyboard(1))
+    return True
+
+async def admin_help_callback(update, context):
+    query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("⛔ Admin only.", show_alert=True)
+        return
+    try:
+        page = int(query.data.rsplit("_", 1)[1])
+    except (ValueError, IndexError):
+        page = 1
+    page = max(1, min(3, page))
+    await query.answer()
+    await query.edit_message_text(ADMIN_HELP_PAGES[page], parse_mode="HTML", reply_markup=admin_help_keyboard(page))
+
 async def settings_command(update, context):
     await update.effective_message.reply_text("⚙️ *Settings*\n\nChoose your language:", reply_markup=settings_keyboard(), parse_mode="Markdown")
 
@@ -661,6 +952,8 @@ async def ui_text_action(update, context, text):
         await settings_command(update, context); return True
     if text == "❓ Help":
         await help_command(update, context); return True
+    if text == "🛡️ Admin Commands":
+        return await admin_help_button(update, context)
     return False
 
 def make_progress_bar(percent: int, width: int = 10) -> str:
@@ -1651,7 +1944,22 @@ def main():
     app.add_handler(CommandHandler("user", user_details_command))
     app.add_handler(CommandHandler("searchuser", searchuser_command))
     app.add_handler(CommandHandler("block", block_command))
+    app.add_handler(CommandHandler("ban", ban_command))
     app.add_handler(CommandHandler("unblock", unblock_command))
+    app.add_handler(CommandHandler("unban", unban_command))
+    app.add_handler(CommandHandler("adminlist", admin_list_command))
+    app.add_handler(CommandHandler("addadmin", add_admin_command))
+    app.add_handler(CommandHandler("deladmin", del_admin_command))
+    app.add_handler(CommandHandler("activeusers", activeusers_command))
+    app.add_handler(CommandHandler("newuser", newuser_command))
+    app.add_handler(CommandHandler("topuser", topuser_command))
+    app.add_handler(CommandHandler("usercount", usercount_command))
+    app.add_handler(CommandHandler("ping", ping_command))
+    app.add_handler(CommandHandler("restart", restart_command))
+    app.add_handler(CommandHandler("about", about_command))
+    app.add_handler(CommandHandler("support", support_command))
+    app.add_handler(CommandHandler("helpuser", helpuser_command))
+    app.add_handler(CommandHandler("helpadmin", helpadmin_command))
     app.add_handler(CommandHandler("maintenance", maintenance_command))
     app.add_handler(CommandHandler("announce", announce_command))
     app.add_handler(CommandHandler("settings", settings_command))
@@ -1660,6 +1968,7 @@ def main():
     app.add_handler(CommandHandler("mystats", user_stats_view))
     app.add_handler(CommandHandler("history", user_features_command))
     app.add_handler(CallbackQueryHandler(ui_callback, pattern=r"^(ui_|lang_|user_profile$|user_stats$|hist_(downloads|scans|generates|activity)$)"))
+    app.add_handler(CallbackQueryHandler(admin_help_callback, pattern=r"^admin_help_[123]$"))
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin_"))
 
     # ==========================================

@@ -1,27 +1,8 @@
-# ASSISTANT BOT - V5
+# Assistant Bot V8
 
-Telegram bot with:
-- QR Code Scanner
-- QR Code Generator
-- TikTok Downloader
+V8 keeps the QR and TikTok fixes and hardens sequential TikTok downloads.
 
-## V5 QR improvements
-- QR scanner uses OpenCV first and pyzbar/ZBar fallback.
-- Tries contrast, grayscale and threshold variants for difficult images.
-- Supports multiple QR codes in one image.
-- Supports Telegram photos and image documents.
-- Keeps the Telegram event loop responsive by running QR decoding/generation in a worker thread.
-- Uses unique temporary files so multiple users/scans do not overwrite each other.
-- QR generator keeps the bot logo small enough to preserve scan reliability.
-- QR generator supports Unicode text and arbitrary links.
-- TikTok fixes from V4 are preserved.
-
-## Deployment
-The Dockerfile installs `libzbar0`, which is required by pyzbar on Debian/Ubuntu-style Linux systems.
-
-
-## Render native Python runtime
-This project does not require the system ZBar library at startup. QR scanning uses OpenCV first and treats pyzbar/ZBar as an optional fallback. This avoids a startup crash on Render's native Python runtime, where `libzbar0` is not installed by `requirements.txt`.
-
-
-V7: enhanced QR scanner with independent multi-image processing, rotations, upscaling, borders, thresholding and pyzbar/OpenCV fallback.
+- Every TikTok URL starts a fresh flow, regardless of previous state.
+- Each download gets a unique temporary output filename.
+- TikTok yt-dlp extraction/download is serialized and retried up to 3 times.
+- QR scanner/generator behavior from V7 is preserved.

@@ -1,5 +1,7 @@
 import os
 import shutil
+import time
+import threading
 import yt_dlp
 from yt_dlp.networking.impersonate import ImpersonateTarget
 
@@ -16,6 +18,11 @@ TIKTOK_USER_AGENT = os.environ.get(
 # and avoids newer TikTok fingerprint regressions.
 TIKTOK_IMPERSONATE = os.environ.get("TIKTOK_IMPERSONATE", "chrome-131")
 TIKTOK_COOKIES_FILE = os.environ.get("TIKTOK_COOKIES_FILE")
+
+# yt-dlp/TikTok can intermittently reject sequential requests. Serialize
+# extraction/download per process and retry with a fresh YoutubeDL instance.
+_TIKTOK_LOCK = threading.Lock()
+
 
 
 def _base_options():
@@ -49,12 +56,19 @@ def _base_options():
 
 
 def get_video_info(url):
-    options = _base_options()
-    options["skip_download"] = True
-
-    with yt_dlp.YoutubeDL(options) as ydl:
-        return ydl.extract_info(url, download=False)
-
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            with _TIKTOK_LOCK:
+                options = _base_options()
+                options["skip_download"] = True
+                with yt_dlp.YoutubeDL(options) as ydl:
+                    return ydl.extract_info(url, download=False)
+        except Exception as exc:
+            last_error = exc
+            if attempt < 3:
+                time.sleep(1.5 * attempt)
+    raise last_error
 
 def get_quality_formats(info):
     formats = {}
@@ -87,34 +101,43 @@ def _has_ffmpeg():
 
 def download_video(url, output_path, max_height):
     max_height = int(max_height)
-    options = _base_options()
-    options["outtmpl"] = output_path
-    options["merge_output_format"] = "mp4"
+    last_error = None
 
-    if _has_ffmpeg():
-        # Prefer separate video/audio streams, then fall back to a combined
-        # stream. This gives the requested quality when TikTok exposes it.
-        options["format"] = (
-            f"bv*[height<={max_height}]+ba/"
-            f"b[height<={max_height}]/"
-            "bv*+ba/b"
-        )
-    else:
-        # Without ffmpeg, never request two streams that need merging.
-        options["format"] = f"b[height<={max_height}]/b"
+    for attempt in range(1, 4):
+        try:
+            with _TIKTOK_LOCK:
+                options = _base_options()
+                options["outtmpl"] = output_path
+                options["merge_output_format"] = "mp4"
 
-    with yt_dlp.YoutubeDL(options) as ydl:
-        ydl.download([url])
+                if _has_ffmpeg():
+                    options["format"] = (
+                        f"bv*[height<={max_height}]+ba/"
+                        f"b[height<={max_height}]/"
+                        "bv*+ba/b"
+                    )
+                else:
+                    options["format"] = f"b[height<={max_height}]/b"
 
-    if os.path.exists(output_path):
-        return output_path
+                with yt_dlp.YoutubeDL(options) as ydl:
+                    ydl.download([url])
 
-    base, _ = os.path.splitext(output_path)
-    for ext in (".mp4", ".webm", ".mkv", ".mov"):
-        candidate = base + ext
-        if os.path.exists(candidate):
-            return candidate
+            if os.path.exists(output_path):
+                return output_path
 
-    raise FileNotFoundError(
-        "yt-dlp finished but the downloaded video file was not found."
-    )
+            base, _ = os.path.splitext(output_path)
+            for ext in (".mp4", ".webm", ".mkv", ".mov"):
+                candidate = base + ext
+                if os.path.exists(candidate):
+                    return candidate
+
+            raise FileNotFoundError(
+                "yt-dlp finished but the downloaded video file was not found."
+            )
+        except Exception as exc:
+            last_error = exc
+            if attempt < 3:
+                time.sleep(2.0 * attempt)
+
+    raise last_error
+

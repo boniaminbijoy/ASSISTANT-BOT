@@ -700,7 +700,7 @@ async def handle_tiktok_quality(
 
     output_path = os.path.join(
         os.getcwd(),
-        f"tiktok_{user_id}.mp4"
+        f"tiktok_{user_id}_{update.message.message_id}.mp4"
     )
 
     try:
@@ -862,10 +862,12 @@ async def handle_text(
     # tiktok_url first, a new TikTok URL is mistakenly sent to the
     # quality handler and silently ignored. Detect a new TikTok URL first.
 
-    if (
-        context.user_data.get("tiktok_mode", False)
-        and is_tiktok_url(text)
-    ):
+    # A TikTok URL always starts a fresh download flow, even if the
+    # previous download has already finished and state was reset.
+    # This is intentionally checked before quality/state handling.
+    if is_tiktok_url(text):
+
+        context.user_data["tiktok_mode"] = True
 
         await handle_tiktok_link(
             update,

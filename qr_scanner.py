@@ -135,7 +135,7 @@ def _load_image(image_path: str):
         return image
 
 
-def scan_qr(image_path: str) -> list[str]:
+def scan_qr(image_path: str, progress_callback=None) -> list[str]:
     if not image_path or not os.path.exists(image_path):
         return []
 
@@ -149,17 +149,38 @@ def scan_qr(image_path: str) -> list[str]:
         scale = 2800 / longest
         image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
 
+    variants = list(_variants(image))
+    total = max(1, len(variants) * 2)
+    done = 0
+
+    def report():
+        nonlocal done
+        done += 1
+        if progress_callback:
+            try:
+                progress_callback(min(99, int(done * 100 / total)))
+            except Exception:
+                pass
+
     # First pass: pyzbar is often better on skewed/photographed QR codes.
-    # It returns all symbols it can decode.
-    for variant in _variants(image):
+    for variant in variants:
         results = _zbar_decode(variant)
+        report()
         if results:
+            if progress_callback:
+                progress_callback(100)
             return results
 
     # Second pass: OpenCV handles UTF-8 and many clean QR screenshots well.
-    for variant in _variants(image):
+    for variant in variants:
         results = _opencv_decode(variant)
+        report()
         if results:
+            if progress_callback:
+                progress_callback(100)
             return results
+
+    if progress_callback:
+        progress_callback(100)
 
     return []

@@ -8,8 +8,10 @@ import qrcode
 from PIL import Image, ImageOps, ImageDraw
 
 
-def generate_qr(data: str, output_path: str, logo_path: str | None = None) -> str:
+def generate_qr(data: str, output_path: str, logo_path: str | None = None, progress_callback=None) -> str:
     data = str(data).strip()
+    if progress_callback:
+        progress_callback(10)
     if not data:
         raise ValueError("QR data cannot be empty")
 
@@ -21,11 +23,16 @@ def generate_qr(data: str, output_path: str, logo_path: str | None = None) -> st
     )
     qr.add_data(data)
     qr.make(fit=True)
+    if progress_callback:
+        progress_callback(45)
 
     qr_image = qr.make_image(
         fill_color="black",
         back_color="white",
     ).convert("RGBA")
+
+    if progress_callback:
+        progress_callback(65)
 
     if logo_path and Path(logo_path).exists():
         logo = Image.open(logo_path)
@@ -51,7 +58,12 @@ def generate_qr(data: str, output_path: str, logo_path: str | None = None) -> st
         y = (qr_image.height - logo_box.height) // 2
         qr_image.alpha_composite(logo_box, (x, y))
 
+    if progress_callback:
+        progress_callback(90)
+
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     qr_image.convert("RGB").save(output, "PNG", optimize=True)
+    if progress_callback:
+        progress_callback(100)
     return str(output)

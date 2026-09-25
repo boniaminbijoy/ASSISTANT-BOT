@@ -80,6 +80,13 @@ def get_main_keyboard():
     )
 
 
+
+
+def make_progress_bar(percent: int, width: int = 10) -> str:
+    percent = max(0, min(100, int(percent)))
+    filled = min(width, percent * width // 100)
+    return "█" * filled + "░" * (width - filled)
+
 # ==================================================
 # RESET ALL MODES
 # ==================================================
@@ -177,9 +184,33 @@ async def handle_qr_image(
         return
 
     detecting_message = await update.message.reply_text(
-        "🔍 **Detecting QR Code...**\n\n⏳ Please wait...",
+        "📷 **Scanning QR Code...**\n\n"
+        f"`{make_progress_bar(0)}` **0%**\n\n"
+        "🔎 Preparing image...",
         parse_mode="Markdown"
     )
+
+    progress_loop = asyncio.get_running_loop()
+    progress_state = {"last": -1}
+
+    def qr_progress(percent):
+        percent = int(percent)
+        if percent != 100 and percent - progress_state["last"] < 5:
+            return
+        progress_state["last"] = percent
+        stage = "🔎 Scanning image..." if percent < 70 else "🧩 Checking QR patterns..."
+        if percent >= 95:
+            stage = "✅ Finalizing..."
+        text = (
+            "📷 **Scanning QR Code...**\n\n"
+            f"`{make_progress_bar(percent)}` **{percent}%**\n\n"
+            f"{stage}"
+        )
+        fut = asyncio.run_coroutine_threadsafe(
+            detecting_message.edit_text(text, parse_mode="Markdown"),
+            progress_loop
+        )
+        fut.add_done_callback(lambda f: None)
 
     user_id = update.message.from_user.id
     temp_dir = tempfile.mkdtemp(prefix=f"qr_scan_{user_id}_")
@@ -201,7 +232,7 @@ async def handle_qr_image(
         await file.download_to_drive(image_path)
 
         # QR decoding is CPU-bound; keep the Telegram event loop responsive.
-        results = await asyncio.to_thread(scan_qr, image_path)
+        results = await asyncio.to_thread(scan_qr, image_path, qr_progress)
 
         if results:
             lines = []
@@ -327,9 +358,38 @@ async def handle_qr_generator_text(
         return
 
     generating_message = await update.message.reply_text(
-        "🔳 **Generating QR Code...**\n\n⏳ Please wait...",
+        "🔳 **Generating QR Code...**\n\n"
+        f"`{make_progress_bar(0)}` **0%**\n\n"
+        "📝 Preparing data...",
         parse_mode="Markdown"
     )
+
+    progress_loop = asyncio.get_running_loop()
+    progress_state = {"last": -1}
+
+    def qr_gen_progress(percent):
+        percent = int(percent)
+        if percent != 100 and percent - progress_state["last"] < 5:
+            return
+        progress_state["last"] = percent
+        if percent < 45:
+            stage = "📝 Preparing data..."
+        elif percent < 70:
+            stage = "🔳 Building QR pattern..."
+        elif percent < 95:
+            stage = "🤖 Adding bot logo..."
+        else:
+            stage = "💾 Saving QR image..."
+        text = (
+            "🔳 **Generating QR Code...**\n\n"
+            f"`{make_progress_bar(percent)}` **{percent}%**\n\n"
+            f"{stage}"
+        )
+        fut = asyncio.run_coroutine_threadsafe(
+            generating_message.edit_text(text, parse_mode="Markdown"),
+            progress_loop
+        )
+        fut.add_done_callback(lambda f: None)
 
     user_id = update.message.from_user.id
     temp_dir = tempfile.mkdtemp(prefix=f"qr_gen_{user_id}_")
@@ -343,7 +403,8 @@ async def handle_qr_generator_text(
             generate_qr,
             data,
             qr_path,
-            logo_path if logo_found else None
+            logo_path if logo_found else None,
+            qr_gen_progress
         )
 
         await generating_message.delete()
@@ -703,6 +764,66 @@ async def handle_tiktok_quality(
         f"tiktok_{user_id}_{update.message.message_id}.mp4"
     )
 
+    # ==========================================
+    # LIVE DOWNLOAD PROGRESS
+    # ==========================================
+
+    progress_loop = asyncio.get_running_loop()
+    progress_state = {"last_update": 0.0, "last_percent": -1}
+
+    def progress_callback(data):
+        if data.get("status") != "downloading":
+            return
+
+        total = data.get("total_bytes") or data.get("total_bytes_estimate")
+        downloaded = data.get("downloaded_bytes") or 0
+        if not total:
+            return
+
+        percent = max(0, min(100, int(downloaded * 100 / total)))
+        # Throttle Telegram edits: at most once every 1.5 seconds, or when
+        # the displayed percentage changes by at least 5 points.
+        import time as _time
+        current_time = _time.monotonic()
+        if (current_time - progress_state["last_update"] < 1.5
+                and percent - progress_state["last_percent"] < 5):
+            return
+
+        progress_state["last_update"] = current_time
+        progress_state["last_percent"] = percent
+
+        speed = data.get("speed")
+        eta = data.get("eta")
+        speed_text = ""
+        if speed:
+            if speed >= 1024 * 1024:
+                speed_text = f"{speed / (1024 * 1024):.1f} MB/s"
+            else:
+                speed_text = f"{speed / 1024:.0f} KB/s"
+
+        eta_text = f"{int(eta)}s" if eta is not None else "--"
+        filled = min(10, percent // 10)
+        bar = "█" * filled + "░" * (10 - filled)
+        status = (
+            f"📥 **Downloading {selected_height}p**\n\n"
+            f"`{bar}` **{percent}%**\n\n"
+            f"⚡ Speed: **{speed_text or '--'}**\n"
+            f"⏱ ETA: **{eta_text}**"
+        )
+
+        future = asyncio.run_coroutine_threadsafe(
+            downloading_message.edit_text(status, parse_mode="Markdown"),
+            progress_loop,
+        )
+
+        def _ignore_edit_error(f):
+            try:
+                f.result()
+            except Exception:
+                pass
+
+        future.add_done_callback(_ignore_edit_error)
+
     try:
 
         # ==========================================
@@ -713,7 +834,8 @@ async def handle_tiktok_quality(
             download_video,
             url,
             output_path,
-            selected_height
+            selected_height,
+            progress_callback
         )
 
         # Check file

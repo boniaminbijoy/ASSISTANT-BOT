@@ -99,7 +99,7 @@ def _has_ffmpeg():
     return shutil.which("ffmpeg") is not None
 
 
-def download_video(url, output_path, max_height):
+def download_video(url, output_path, max_height, progress_callback=None):
     max_height = int(max_height)
     last_error = None
 
@@ -109,6 +109,9 @@ def download_video(url, output_path, max_height):
                 options = _base_options()
                 options["outtmpl"] = output_path
                 options["merge_output_format"] = "mp4"
+
+                if progress_callback:
+                    options["progress_hooks"] = [progress_callback]
 
                 if _has_ffmpeg():
                     options["format"] = (

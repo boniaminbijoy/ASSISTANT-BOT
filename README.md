@@ -1,8 +1,5 @@
-# Assistant Bot V8
+# Assistant Bot Fixed V9
 
-V8 keeps the QR and TikTok fixes and hardens sequential TikTok downloads.
+Includes TikTok downloader, live Telegram download progress, QR scanner and QR generator.
 
-- Every TikTok URL starts a fresh flow, regardless of previous state.
-- Each download gets a unique temporary output filename.
-- TikTok yt-dlp extraction/download is serialized and retried up to 3 times.
-- QR scanner/generator behavior from V7 is preserved.
+TikTok downloads now show a live progress bar with percentage, speed and ETA using yt-dlp progress hooks. Telegram message edits are throttled to avoid excessive API calls.

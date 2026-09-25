@@ -1,5 +1,20 @@
-# Assistant Bot Fixed V9
+# ASSISTANT BOT — Phase 3 Professional
 
-Includes TikTok downloader, live Telegram download progress, QR scanner and QR generator.
+Features:
+- TikTok downloader
+- QR scanner
+- QR generator
+- SQLite user database and usage statistics
+- Admin panel (`/admin`)
+- `/stats` command
+- `/broadcast Your message` broadcast
 
-TikTok downloads now show a live progress bar with percentage, speed and ETA using yt-dlp progress hooks. Telegram message edits are throttled to avoid excessive API calls.
+## Render Admin Setup
+Add environment variable `ADMIN_IDS` with your Telegram numeric user ID. Example: `123456789`.
+
+The user database is stored in `bot_data.db`. For persistent storage across Render restarts, use a persistent disk or migrate the database to PostgreSQL in a later production-hardening step.
+
+## Admin commands
+- `/admin` — admin panel
+- `/stats` — statistics
+- `/broadcast Your message` — broadcast to registered users

@@ -70,57 +70,57 @@ def _add_border(img, px=40):
 
 
 def _variants(image):
-    """Generate bounded, independent variants. No shared mutable state."""
+    """Generate a small, fast set of QR-friendly variants.
+
+    The old scanner used many heavy variants and could appear to stop around
+    50% while OpenCV was processing the second pass. Keep the set bounded so
+    Telegram users get a predictable completion time.
+    """
     if image is None:
         return
 
     h, w = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image.copy()
 
-    # Original + grayscale + border.
     yield image
     yield gray
-    yield _add_border(gray, max(20, min(h, w)//40))
+    yield _add_border(gray, max(20, min(h, w) // 40))
 
-    # Correct uneven lighting / contrast.
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    # Contrast/lighting correction.
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
     yield enhanced
 
-    # Light denoise + sharpen.
-    blur = cv2.GaussianBlur(enhanced, (3, 3), 0)
-    sharp = cv2.addWeighted(enhanced, 1.6, blur, -0.6, 0)
-    yield sharp
-
-    # Threshold variants.
-    for block, c in ((21, 3), (31, 5), (51, 7)):
-        try:
-            yield cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                        cv2.THRESH_BINARY, block, c)
-        except Exception:
-            pass
+    # One adaptive threshold and one Otsu threshold are usually enough.
     try:
-        _, otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        yield cv2.adaptiveThreshold(
+            enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 31, 5
+        )
+    except Exception:
+        pass
+    try:
+        _, otsu = cv2.threshold(
+            enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
         yield otsu
-        yield cv2.bitwise_not(otsu)
     except Exception:
         pass
 
-    # Upscale small/medium images.
+    # Upscale only genuinely small images.
     longest = max(h, w)
-    if longest < 1800:
-        scale = 3.0 if longest < 800 else 2.0
+    if longest < 1400:
+        scale = 2.5 if longest < 800 else 1.8
         up = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
         yield up
-        yield _add_border(up, 50)
+        yield _add_border(up, 40)
 
-    # Rotations help when Telegram/photo orientation is unusual.
-    for angle in (90, 180, 270):
-        rot = cv2.rotate(image, {90: cv2.ROTATE_90_CLOCKWISE,
-                                 180: cv2.ROTATE_180,
-                                 270: cv2.ROTATE_90_COUNTERCLOCKWISE}[angle])
+    # Orientation variants.
+    for code in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_180, cv2.ROTATE_90_COUNTERCLOCKWISE):
+        rot = cv2.rotate(image, code)
         yield rot
-        yield cv2.cvtColor(rot, cv2.COLOR_BGR2GRAY) if len(rot.shape) == 3 else rot
+        if len(rot.shape) == 3:
+            yield cv2.cvtColor(rot, cv2.COLOR_BGR2GRAY)
 
 
 def _load_image(image_path: str):
@@ -145,42 +145,54 @@ def scan_qr(image_path: str, progress_callback=None) -> list[str]:
 
     h, w = image.shape[:2]
     longest = max(h, w)
-    if longest > 2800:
-        scale = 2800 / longest
+    if longest > 2200:
+        scale = 2200 / longest
         image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
 
     variants = list(_variants(image))
-    total = max(1, len(variants) * 2)
-    done = 0
+    total = max(1, len(variants))
 
-    def report():
-        nonlocal done
-        done += 1
+    def report(done):
         if progress_callback:
             try:
-                progress_callback(min(99, int(done * 100 / total)))
+                progress_callback(min(99, int(done * 99 / total)))
             except Exception:
                 pass
 
-    # First pass: pyzbar is often better on skewed/photographed QR codes.
-    for variant in variants:
-        results = _zbar_decode(variant)
-        report()
-        if results:
-            if progress_callback:
-                progress_callback(100)
-            return results
+    # Fast path: OpenCV first. This avoids the old long 0-50% ZBar pass.
+    detector = cv2.QRCodeDetector()
+    for index, variant in enumerate(variants, 1):
+        try:
+            data, _, _ = detector.detectAndDecode(variant)
+            if data:
+                if progress_callback:
+                    progress_callback(100)
+                return _unique([data])
+        except Exception:
+            pass
 
-    # Second pass: OpenCV handles UTF-8 and many clean QR screenshots well.
-    for variant in variants:
-        results = _opencv_decode(variant)
-        report()
+        try:
+            ok, decoded_info, _, _ = detector.detectAndDecodeMulti(variant)
+            if ok and decoded_info:
+                results = _unique([x for x in decoded_info if x])
+                if results:
+                    if progress_callback:
+                        progress_callback(100)
+                    return results
+        except Exception:
+            pass
+        report(index)
+
+    # Fallback: ZBar/pyzbar on the same bounded set.
+    for index, variant in enumerate(variants, 1):
+        results = _zbar_decode(variant)
         if results:
             if progress_callback:
                 progress_callback(100)
             return results
+        report(index)
 
     if progress_callback:
         progress_callback(100)
-
     return []
+

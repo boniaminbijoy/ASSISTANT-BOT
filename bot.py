@@ -3,13 +3,15 @@ import asyncio
 import html
 import tempfile
 import uuid
+import sqlite3
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
 
 from telegram import (
     Update,
-    ReplyKeyboardMarkup
+    ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 )
 
 from telegram.ext import (
@@ -17,7 +19,7 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     ContextTypes,
-    filters
+    filters, CallbackQueryHandler
 )
 
 from qr_scanner import scan_qr
@@ -38,6 +40,132 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN is missing. Add BOT_TOKEN in Render Environment Variables.")
+
+# ==================================================
+# PHASE 3 - USER DATABASE / ADMIN CONFIG
+# ==================================================
+DB_PATH = os.environ.get("BOT_DB_PATH", "bot_data.db")
+ADMIN_IDS = {int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
+
+def db_connect():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+def init_database():
+    with db_connect() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
+            joined_at TEXT NOT NULL, last_seen TEXT NOT NULL, messages INTEGER DEFAULT 0,
+            qr_scans INTEGER DEFAULT 0, qr_generated INTEGER DEFAULT 0,
+            tiktok_downloads INTEGER DEFAULT 0, is_blocked INTEGER DEFAULT 0
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen)")
+        conn.commit()
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+def register_user(user, count_message=False):
+    if not user:
+        return
+    now = utc_now()
+    with db_connect() as conn:
+        conn.execute("""INSERT INTO users(user_id, username, first_name, joined_at, last_seen, messages)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET username=excluded.username,
+            first_name=excluded.first_name, last_seen=excluded.last_seen,
+            messages=users.messages + excluded.messages""",
+            (user.id, user.username or "", user.first_name or "", now, now, 1 if count_message else 0))
+        conn.commit()
+
+def increment_stat(user_id, field):
+    if field not in {"qr_scans", "qr_generated", "tiktok_downloads"}:
+        return
+    with db_connect() as conn:
+        conn.execute(f"UPDATE users SET {field} = {field} + 1, last_seen = ? WHERE user_id = ?", (utc_now(), user_id))
+        conn.commit()
+
+def get_stats():
+    with db_connect() as conn:
+        row = conn.execute("""SELECT COUNT(*), SUM(CASE WHEN julianday(last_seen) >= julianday('now','-1 day') THEN 1 ELSE 0 END),
+            COALESCE(SUM(messages),0), COALESCE(SUM(qr_scans),0), COALESCE(SUM(qr_generated),0),
+            COALESCE(SUM(tiktok_downloads),0) FROM users""").fetchone()
+    return row
+
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
+
+def admin_keyboard():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📊 Statistics", callback_data="admin_stats"),
+        InlineKeyboardButton("👥 Users", callback_data="admin_users")
+    ], [InlineKeyboardButton("📢 Broadcast Help", callback_data="admin_broadcast")]])
+
+async def admin_panel(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ You are not authorized to use the admin panel.")
+        return
+    await update.effective_message.reply_text(
+        "🛠️ *ADMIN PANEL*\n\nChoose an option:", reply_markup=admin_keyboard(), parse_mode="Markdown")
+
+async def stats_command(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Admin only.")
+        return
+    total, active24, messages, scans, generated, downloads = get_stats()
+    await update.effective_message.reply_text(
+        f"📊 *BOT STATISTICS*\n\n👥 Total users: *{total}*\n🟢 Active (24h): *{active24}*\n💬 Messages: *{messages}*\n📷 QR scans: *{scans}*\n🔳 QR generated: *{generated}*\n🎵 TikTok downloads: *{downloads}*",
+        parse_mode="Markdown")
+
+async def broadcast_command(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Admin only.")
+        return
+    text = update.message.text.partition(" ")[2].strip()
+    if not text:
+        await update.effective_message.reply_text("📢 Usage: /broadcast Your message here")
+        return
+    with db_connect() as conn:
+        users = [r[0] for r in conn.execute("SELECT user_id FROM users WHERE is_blocked=0").fetchall()]
+    sent = failed = 0
+    status = await update.effective_message.reply_text(f"📢 Broadcasting to {len(users)} users...\n`0%`", parse_mode="Markdown")
+    for i, uid in enumerate(users, 1):
+        try:
+            await context.bot.send_message(chat_id=uid, text=text)
+            sent += 1
+        except Exception as exc:
+            failed += 1
+            if "blocked" in str(exc).lower() or "chat not found" in str(exc).lower():
+                with db_connect() as conn:
+                    conn.execute("UPDATE users SET is_blocked=1 WHERE user_id=?", (uid,))
+                    conn.commit()
+        if i == len(users) or i % max(1, len(users)//10) == 0:
+            try:
+                await status.edit_text(f"📢 Broadcasting...\n`{i*100//max(1,len(users))}%`", parse_mode="Markdown")
+            except Exception:
+                pass
+    await status.edit_text(f"✅ *Broadcast complete*\n\n📨 Sent: *{sent}*\n⚠️ Failed: *{failed}*", parse_mode="Markdown")
+
+async def admin_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.edit_message_text("⛔ Admin only.")
+        return
+    if query.data == "admin_stats":
+        total, active24, messages, scans, generated, downloads = get_stats()
+        await query.edit_message_text(f"📊 *BOT STATISTICS*\n\n👥 Total users: *{total}*\n🟢 Active (24h): *{active24}*\n💬 Messages: *{messages}*\n📷 QR scans: *{scans}*\n🔳 QR generated: *{generated}*\n🎵 TikTok downloads: *{downloads}*", parse_mode="Markdown", reply_markup=admin_keyboard())
+    elif query.data == "admin_users":
+        total, active24, *_ = get_stats()
+        await query.edit_message_text(f"👥 *USER DATABASE*\n\nTotal registered users: *{total}*\nActive in last 24h: *{active24}*\n\nUse /broadcast <message> to send a broadcast.", parse_mode="Markdown", reply_markup=admin_keyboard())
+    elif query.data == "admin_broadcast":
+        await query.edit_message_text("📢 *BROADCAST*\n\nSend:\n`/broadcast Your message here`\n\nThe bot will send it to all registered users.", parse_mode="Markdown", reply_markup=admin_keyboard())
+
+async def track_update(update, context):
+    if update.effective_user:
+        register_user(update.effective_user, count_message=bool(update.effective_message))
+
 
 # ==================================================
 # RENDER WEB SERVICE PORT
@@ -195,12 +323,7 @@ async def handle_qr_image(
 
     def qr_progress(percent):
         percent = int(percent)
-        # 100% is handled by handle_qr_image itself. Scheduling a 100% edit
-        # from the worker thread can race with the final result edit and
-        # overwrite the decoded QR result.
-        if percent >= 100:
-            return
-        if percent - progress_state["last"] < 5:
+        if percent != 100 and percent - progress_state["last"] < 5:
             return
         progress_state["last"] = percent
         stage = "🔎 Scanning image..." if percent < 70 else "🧩 Checking QR patterns..."
@@ -240,10 +363,11 @@ async def handle_qr_image(
         results = await asyncio.to_thread(scan_qr, image_path, qr_progress)
 
         if results:
+            increment_stat(update.effective_user.id, "qr_scans")
             lines = []
             for index, result in enumerate(results, 1):
                 safe = html.escape(result)
-                lines.append(f"<b>{index}.</b> <code>{safe}</code>")
+                lines.append(f"**{index}.** <code>{safe}</code>")
 
             await detecting_message.edit_text(
                 "✅ <b>QR CODE DETECTED!</b>\n\n"
@@ -416,6 +540,7 @@ async def handle_qr_generator_text(
 
         safe_data = html.escape(data)
         with open(qr_path, "rb") as qr_file:
+            increment_stat(update.effective_user.id, "qr_generated")
             await update.message.reply_photo(
                 photo=qr_file,
                 caption=(
@@ -882,6 +1007,8 @@ async def handle_tiktok_quality(
                 parse_mode="Markdown"
             )
 
+        increment_stat(update.effective_user.id, "tiktok_downloads")
+
         # Delete status message
         await downloading_message.delete()
 
@@ -1064,17 +1191,9 @@ async def handle_text(
 # MAIN
 # ==================================================
 
-async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Log unexpected bot errors without leaving them as unhandled exceptions."""
-    error = context.error
-    print("Unhandled bot error:", repr(error))
-
-    # Telegram polling conflicts are caused by another process using the same
-    # bot token. Do not attempt to hide or auto-retry this condition here.
-    # The deployment must have exactly one polling instance.
-
-
 def main():
+
+    init_database()
 
     app = (
         Application
@@ -1083,11 +1202,17 @@ def main():
         .build()
     )
 
+    # Phase 3: track every update before normal handlers
+    app.add_handler(MessageHandler(filters.ALL, track_update), group=-1)
+
+    app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin_"))
+
     # ==========================================
     # /start
     # ==========================================
-
-    app.add_error_handler(global_error_handler)
 
     app.add_handler(
         CommandHandler(

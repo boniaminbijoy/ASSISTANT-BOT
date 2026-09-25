@@ -22,3 +22,6 @@ The Dockerfile installs `libzbar0`, which is required by pyzbar on Debian/Ubuntu
 
 ## Render native Python runtime
 This project does not require the system ZBar library at startup. QR scanning uses OpenCV first and treats pyzbar/ZBar as an optional fallback. This avoids a startup crash on Render's native Python runtime, where `libzbar0` is not installed by `requirements.txt`.
+
+
+V7: enhanced QR scanner with independent multi-image processing, rotations, upscaling, borders, thresholding and pyzbar/OpenCV fallback.

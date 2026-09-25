@@ -26,6 +26,7 @@ from telegram.ext import (
 
 from qr_scanner import scan_qr
 from qr_generator import generate_qr
+from ai_label_remover import remove_ai_label
 
 from tiktok_downloader import (
     get_video_info,
@@ -302,6 +303,7 @@ def admin_keyboard():
         [InlineKeyboardButton("📣 Announcement", callback_data="admin_announce"), InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings")],
         [InlineKeyboardButton(f"🔧 M:{'ON' if maintenance_enabled() else 'OFF'}", callback_data="set_maintenance_toggle"), InlineKeyboardButton(f"🎵 D:{'ON' if feature_enabled('downloader') else 'OFF'}", callback_data="set_downloader_toggle")],
         [InlineKeyboardButton(f"📷 S:{'ON' if feature_enabled('qr_scanner') else 'OFF'}", callback_data="set_scanner_toggle"), InlineKeyboardButton(f"🔲 G:{'ON' if feature_enabled('qr_generator') else 'OFF'}", callback_data="set_generator_toggle")],
+        [InlineKeyboardButton(f"🪄 AI:{'ON' if feature_enabled('ai_label_remover') else 'OFF'}", callback_data="set_ai_label_toggle")],
         [InlineKeyboardButton("🧪 System Status", callback_data="admin_status")],
         [InlineKeyboardButton("🏠 Home", callback_data="ui_home")],
     ])
@@ -751,7 +753,7 @@ async def status_callback(update, context):
     ]
     features = [
         ('📥 Downloader', feature_enabled('downloader')), ('📷 QR Scanner', feature_enabled('qr_scanner')),
-        ('🔲 QR Generator', feature_enabled('qr_generator')), ('🆘 User Support', True),
+        ('🔲 QR Generator', feature_enabled('qr_generator')), ('🪄 AI Label Remover', feature_enabled('ai_label_remover')), ('🆘 User Support', True),
         ('📢 Broadcast', True), ('⏰ Scheduled Broadcast', True), ('🚨 Error Monitoring', True),
         ('🛡️ Admin Commands', True), ('⚙️ Feature Settings', True),
     ]
@@ -764,12 +766,13 @@ async def status_callback(update, context):
 
 async def settings_admin_callback(update, context):
     q=update.callback_query
-    lines=['⚙️ *BOT SETTINGS*\n',f"🔧 Maintenance: *{'ON' if maintenance_enabled() else 'OFF'}*",f"🎵 Downloader: *{'ON' if feature_enabled('downloader') else 'OFF'}*",f"📷 QR Scanner: *{'ON' if feature_enabled('qr_scanner') else 'OFF'}*",f"🔲 QR Generator: *{'ON' if feature_enabled('qr_generator') else 'OFF'}*"]
+    lines=['⚙️ *BOT SETTINGS*\n',f"🔧 Maintenance: *{'ON' if maintenance_enabled() else 'OFF'}*",f"🎵 Downloader: *{'ON' if feature_enabled('downloader') else 'OFF'}*",f"📷 QR Scanner: *{'ON' if feature_enabled('qr_scanner') else 'OFF'}*",f"🔲 QR Generator: *{'ON' if feature_enabled('qr_generator') else 'OFF'}*",f"🪄 AI Label Remover: *{'ON' if feature_enabled('ai_label_remover') else 'OFF'}*"]
     kb=InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🔧 Maintenance: {'ON' if maintenance_enabled() else 'OFF'}",callback_data='set_maintenance_toggle')],
         [InlineKeyboardButton(f"🎵 Downloader: {'ON' if feature_enabled('downloader') else 'OFF'}",callback_data='set_downloader_toggle')],
         [InlineKeyboardButton(f"📷 Scanner: {'ON' if feature_enabled('qr_scanner') else 'OFF'}",callback_data='set_scanner_toggle')],
         [InlineKeyboardButton(f"🔲 Generator: {'ON' if feature_enabled('qr_generator') else 'OFF'}",callback_data='set_generator_toggle')],
+        [InlineKeyboardButton(f"🪄 AI Label Remover: {'ON' if feature_enabled('ai_label_remover') else 'OFF'}",callback_data='set_ai_label_toggle')],
         [InlineKeyboardButton('🏠 Admin Panel',callback_data='admin_panel_home')]
     ])
     await q.edit_message_text('\n'.join(lines),parse_mode='Markdown',reply_markup=kb)
@@ -889,8 +892,8 @@ async def admin_callback(update, context):
     elif d=='admin_settings': await settings_admin_callback(update, context)
     elif d=='admin_status': await status_callback(update, context)
     elif d=='admin_panel_home': await query.edit_message_text('🛠️ *ADVANCED ADMIN PANEL*\n\nChoose an option:',parse_mode='Markdown',reply_markup=admin_keyboard())
-    elif d in {'set_maintenance_toggle','set_downloader_toggle','set_scanner_toggle','set_generator_toggle'}:
-        keymap={'set_maintenance_toggle':'maintenance','set_downloader_toggle':'downloader','set_scanner_toggle':'qr_scanner','set_generator_toggle':'qr_generator'}
+    elif d in {'set_maintenance_toggle','set_downloader_toggle','set_scanner_toggle','set_generator_toggle','set_ai_label_toggle'}:
+        keymap={'set_maintenance_toggle':'maintenance','set_downloader_toggle':'downloader','set_scanner_toggle':'qr_scanner','set_generator_toggle':'qr_generator','set_ai_label_toggle':'ai_label_remover'}
         key=keymap[d]
         if key=='maintenance': set_maintenance(not maintenance_enabled())
         else: set_setting(key,'0' if feature_enabled(key) else '1')
@@ -1059,8 +1062,9 @@ def get_main_keyboard(language="en", is_admin_user=False):
     keyboard = [
         ["📥 Downloader", "📷 QR Scanner"],
         ["🔲 QR Generator", "📊 My Stats"],
-        ["👤 My Profile", "🕘 My History"],
-        ["⚙️ Settings", "❓ Help"],
+        ["🪄 AI Label Remover", "👤 My Profile"],
+        ["🕘 My History", "⚙️ Settings"],
+        ["❓ Help"],
     ]
     # Admin-only button: normal users never see this button.
     if is_admin_user:
@@ -1240,6 +1244,8 @@ async def ui_text_action(update, context, text):
         await qr_scanner_start(update, context); return True
     if text == "🔲 QR Generator":
         await qr_generator_start(update, context); return True
+    if text == "🪄 AI Label Remover":
+        await ai_label_remover_start(update, context); return True
     if text == "📊 My Stats":
         messages, scans, generated, downloads = get_user_stats(user.id)
         msg = f"📊 *My Statistics*\n\n💬 Messages: *{messages}*\n📷 QR Scans: *{scans}*\n🔲 QR Generated: *{generated}*\n🎵 TikTok Downloads: *{downloads}*"
@@ -1271,6 +1277,7 @@ def reset_modes(context):
 
     context.user_data["qr_generator_mode"] = False
     context.user_data["qr_generator_data"] = None
+    context.user_data["ai_label_remover_mode"] = False
 
     context.user_data["tiktok_mode"] = False
     context.user_data["tiktok_url"] = None
@@ -1287,6 +1294,55 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # QR CODE SCANNER BUTTON
 # ==================================================
+
+async def ai_label_remover_start(update, context):
+    if not feature_enabled('ai_label_remover') and not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text('🪄 AI Label Remover is temporarily disabled by Admin.')
+        return
+    reset_modes(context)
+    context.user_data["ai_label_remover_mode"] = True
+    lang = get_user_language(update.effective_user.id)
+    text = (
+        "🪄 *AI Label Remover*\n\nSend an image. I will process it and return a cleaned copy.\n\nYou can send another image immediately after the result — the tool stays active.\n\nSend /start to exit."
+        if lang != 'bn' else
+        "🪄 *AI Label Remover*\n\nএকটি ছবি পাঠান। আমি সেটি প্রসেস করে cleaned copy ফেরত দেব।\n\nফলাফল পাওয়ার পর আবার ছবি পাঠালেই নতুন কাজ শুরু হবে।\n\nবন্ধ করতে /start দিন।"
+    )
+    await update.effective_message.reply_text(text, parse_mode='Markdown')
+
+async def handle_ai_label_image(update, context):
+    if not context.user_data.get('ai_label_remover_mode', False):
+        return False
+    if not feature_enabled('ai_label_remover') and not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text('🪄 AI Label Remover is temporarily disabled by Admin.')
+        return True
+    user_id = update.effective_user.id
+    status = await update.effective_message.reply_text('🪄 *Processing image...*\n\n`░░░░░░░░░░` **0%**', parse_mode='Markdown')
+    temp_dir = tempfile.mkdtemp(prefix=f"ai_label_{user_id}_")
+    src = os.path.join(temp_dir, f"input_{uuid.uuid4().hex}.jpg")
+    out = os.path.join(temp_dir, f"clean_{uuid.uuid4().hex}.jpg")
+    try:
+        media = update.message.photo[-1] if update.message.photo else update.message.document
+        f = await context.bot.get_file(media.file_id)
+        await f.download_to_drive(src)
+        await status.edit_text('🪄 *Processing image...*\n\n`█████░░░░░` **50%**', parse_mode='Markdown')
+        changed = await asyncio.to_thread(remove_ai_label, src, out)
+        await status.edit_text('🪄 *Finalizing...*\n\n`██████████` **100%**', parse_mode='Markdown')
+        caption = '✅ Clean image ready.\n\n🪄 Send another image to process again.' if changed else '✅ Image processed. No clear label region was detected, so the original image was kept.\n\n🪄 Send another image to process again.'
+        with open(out, 'rb') as fh:
+            await update.effective_message.reply_photo(photo=fh, caption=caption)
+        log_activity(user_id, 'ai_label_remove', 'changed' if changed else 'no_change')
+    except Exception as exc:
+        await status.edit_text(f'❌ *Processing failed*\n\n`{html.escape(type(exc).__name__ + ": " + str(exc)[:300])}`', parse_mode='Markdown')
+    finally:
+        try:
+            for p in (src, out):
+                if os.path.exists(p): os.remove(p)
+            os.rmdir(temp_dir)
+        except OSError:
+            pass
+    # Deliberately keep ai_label_remover_mode=True so the next image starts immediately.
+    raise ApplicationHandlerStop
+    return True
 
 async def qr_scanner_start(
     update: Update,
@@ -1438,6 +1494,7 @@ async def qr_generator_start(
     context.user_data["qr_generator_mode"] = True
 
     context.user_data["qr_generator_data"] = None
+    context.user_data["ai_label_remover_mode"] = False
 
     await update.message.reply_text(
         "🔳 **QR CODE GENERATOR**\n\n"
@@ -1596,6 +1653,7 @@ async def handle_qr_generator_text(
         except OSError:
             pass
         context.user_data["qr_generator_data"] = None
+    context.user_data["ai_label_remover_mode"] = False
 
 
 # ==================================================
@@ -2097,11 +2155,13 @@ async def handle_text(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if await support_message(update, context):
-        return
     text = update.message.text.strip()
 
+    # UI buttons must be handled before support mode. Otherwise the button label itself
+    # is forwarded to admins as if it were a support message.
     if await ui_text_action(update, context, text):
+        return
+    if await support_message(update, context):
         return
 
     # ==========================================
@@ -2313,6 +2373,13 @@ def main():
     # QR IMAGES
     # ==========================================
 
+    app.add_handler(
+        MessageHandler(
+            filters.PHOTO | filters.Document.IMAGE,
+            handle_ai_label_image,
+            block=False
+        )
+    )
     app.add_handler(
         MessageHandler(
             filters.PHOTO | filters.Document.IMAGE,

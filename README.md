@@ -1,8 +1,8 @@
-# 🤖 Assistant Bot — V42
+# 🤖 Assistant Bot — V43
 
 A Telegram all-in-one utility bot with downloader, QR tools, Image Tools, Video → Audio extraction, user account features, admin controls, support, broadcasts, scheduled tasks, monitoring, and recovery helpers.
 
-## ✨ V42 — Telegram Official Ads Monetization
+## ✨ V43 — Video Link → Audio Upgrade
 
 ### 🖼️ Image Tools fixes
 - After an Image Tool operation finishes, the selected operation stays active.
@@ -22,7 +22,8 @@ A Telegram all-in-one utility bot with downloader, QR tools, Image Tools, Video 
 ### 🎵 Video → Audio
 - New Home menu: **🎵 Video To Audio**
 - Command: `/audioextract`
-- Send a video and the bot extracts its audio as **MP3** using FFmpeg.
+- Send a video file **or paste a video link** and the bot extracts its audio as **MP3**.
+- Link mode uses yt-dlp site extractors plus its generic extractor for broad public-web coverage, then FFmpeg converts the audio to MP3.
 - Supports common video containers such as MP4, MKV, MOV, WebM, AVI, M4V, 3GP, FLV, TS and MTS.
 - The extracted MP3 is returned as Telegram audio with a clean `.mp3` filename.
 - Users can send another video immediately after extraction.
@@ -153,7 +154,7 @@ BOT_DB_PATH=bot_data.db
 
 The included Dockerfile installs FFmpeg and the required system packages.
 
-## 🧪 V42 Test Checklist
+## 🧪 V43 Test Checklist
 
 ### Image Tools
 - [ ] Compress image
@@ -166,9 +167,15 @@ The included Dockerfile installs FFmpeg and the required system packages.
 - [ ] Image Tools does not ask to select QR Scanner
 - [ ] QR Scanner still works when explicitly selected
 
+### Video → Audio link coverage
+- Uses the current yt-dlp extractor library rather than a hard-coded platform list. yt-dlp includes many site-specific extractors and also a generic extractor for additional pages/embeds.
+- A public URL is required. Private/login-only videos, DRM-protected streams, CAPTCHA challenges, geo-restricted content, or a site that has recently changed can still be unavailable.
+- The bot does not bypass DRM, authentication, or access controls.
+
 ### Video → Audio
 - [ ] Open from Home
-- [ ] `/audioextract` works
+- [ ] `/audioextract` works with an uploaded video
+- [ ] `/audioextract` works with a supported public video URL
 - [ ] MP4 with audio → MP3
 - [ ] Send a second video immediately after the first
 - [ ] Video without audio shows a useful error
@@ -184,6 +191,11 @@ The included Dockerfile installs FFmpeg and the required system packages.
 - [ ] Health endpoint / recovery
 
 ## 📝 Version History
+
+### V43
+- Upgraded Video → Audio to accept supported public video links in addition to uploaded video files.
+- Added yt-dlp link extraction with retries and FFmpeg MP3 conversion.
+- Added a Telegram 50 MB output-size guard for MP3 uploads.
 
 ### V42
 - Removed any planned Premium/quota concept from the monetization design.
@@ -201,6 +213,7 @@ The included Dockerfile installs FFmpeg and the required system packages.
 - Removed completed Image Tools progress messages.
 - Improved repeated-image workflow.
 - Added Video → Audio MP3 extractor using FFmpeg.
+- Added Video → Audio link support using yt-dlp + FFmpeg.
 - Added `/audioextract`.
 - Added Home menu button for Video → Audio.
 - Updated command menu and documentation.
@@ -236,3 +249,27 @@ The included Dockerfile installs FFmpeg and the required system packages.
 - Telegram file-size and Bot API limits still apply.
 - Only one polling instance should use the same bot token at a time.
 - Render Free service sleep/restart behavior is separate from application-level recovery logic.
+
+
+### Video Link → Audio coverage
+- YouTube, TikTok and Instagram receive dedicated yt-dlp retry/format handling.
+- Other public video hosts use yt-dlp site-specific extractors and a generic extractor fallback.
+- Private/login-only, DRM-protected, CAPTCHA/geo-blocked content or sites that recently changed can still fail; the bot does not bypass access controls.
+
+### V46 — Security Hardening
+- Added per-user sliding-window anti-spam/rate limiting.
+- Added per-user and global concurrent-job limits to reduce resource exhaustion.
+- Added maximum text/URL length controls.
+- Added public URL validation that rejects embedded credentials and obvious private/local/reserved network targets before yt-dlp processing.
+- Added Telegram media size guard before and after download for Video → Audio.
+- Kept temporary-file cleanup in `finally` blocks.
+- Security controls are configurable with environment variables:
+  - `SECURITY_RATE_WINDOW` (default 60 seconds)
+  - `SECURITY_RATE_MAX` (default 20 requests/window)
+  - `SECURITY_MAX_URL_LENGTH` (default 2048)
+  - `SECURITY_MAX_INPUT_CHARS` (default 10000)
+  - `SECURITY_MAX_UPLOAD_MB` (default 100)
+  - `SECURITY_MAX_AUDIO_MB` (default 50)
+  - `SECURITY_MAX_CONCURRENT_JOBS` (default 2/user)
+  - `SECURITY_GLOBAL_JOB_LIMIT` (default 6)
+- These controls are defensive limits; they do not bypass Telegram, platform authentication, DRM, CAPTCHA, or access controls.

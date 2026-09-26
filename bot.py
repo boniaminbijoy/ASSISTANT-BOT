@@ -8,9 +8,15 @@ import traceback
 import sys
 import time
 import shutil
+import ipaddress
+import socket
+from collections import defaultdict, deque
+from contextlib import suppress
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
+
+import yt_dlp
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from PIL import Image, ImageOps
@@ -70,6 +76,111 @@ if not BOT_TOKEN:
 # ==================================================
 DB_PATH = os.environ.get("BOT_DB_PATH", "bot_data.db")
 ADMIN_IDS = {int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").replace(";", ",").split(",") if x.strip().isdigit()}
+
+# ==================================================
+# SECURITY / ABUSE CONTROLS
+# ==================================================
+# Secure defaults; tune with Render environment variables if needed.
+SECURITY_RATE_WINDOW = max(10, int(os.environ.get("SECURITY_RATE_WINDOW", "60")))
+SECURITY_RATE_MAX = max(3, int(os.environ.get("SECURITY_RATE_MAX", "20")))
+SECURITY_MAX_URL_LENGTH = max(256, int(os.environ.get("SECURITY_MAX_URL_LENGTH", "2048")))
+SECURITY_MAX_INPUT_CHARS = max(512, int(os.environ.get("SECURITY_MAX_INPUT_CHARS", "10000")))
+SECURITY_MAX_UPLOAD_MB = max(10, int(os.environ.get("SECURITY_MAX_UPLOAD_MB", "100")))
+SECURITY_MAX_AUDIO_MB = max(10, int(os.environ.get("SECURITY_MAX_AUDIO_MB", "50")))
+SECURITY_MAX_CONCURRENT_JOBS = max(1, int(os.environ.get("SECURITY_MAX_CONCURRENT_JOBS", "2")))
+SECURITY_GLOBAL_JOB_LIMIT = max(1, int(os.environ.get("SECURITY_GLOBAL_JOB_LIMIT", "6")))
+
+_RATE_BUCKETS = defaultdict(deque)
+_RATE_LOCK = Lock()
+_USER_JOB_SEMAPHORES = {}
+_USER_JOB_LOCK = Lock()
+_GLOBAL_JOB_SEMAPHORE = asyncio.Semaphore(SECURITY_GLOBAL_JOB_LIMIT)
+
+def security_allow(user_id, cost=1):
+    """Per-user sliding-window limiter. Returns False when the request is too fast."""
+    now = time.monotonic()
+    key = int(user_id)
+    with _RATE_LOCK:
+        bucket = _RATE_BUCKETS[key]
+        cutoff = now - SECURITY_RATE_WINDOW
+        while bucket and bucket[0] <= cutoff:
+            bucket.popleft()
+        if len(bucket) + cost > SECURITY_RATE_MAX:
+            return False
+        for _ in range(cost):
+            bucket.append(now)
+        # Bound memory if a malicious client creates many user IDs.
+        if len(_RATE_BUCKETS) > 20000:
+            stale = [k for k, v in _RATE_BUCKETS.items() if not v or v[-1] <= cutoff]
+            for k in stale[:5000]:
+                _RATE_BUCKETS.pop(k, None)
+        return True
+
+def get_user_job_semaphore(user_id):
+    with _USER_JOB_LOCK:
+        sem = _USER_JOB_SEMAPHORES.get(int(user_id))
+        if sem is None:
+            sem = asyncio.Semaphore(SECURITY_MAX_CONCURRENT_JOBS)
+            _USER_JOB_SEMAPHORES[int(user_id)] = sem
+        return sem
+
+async def acquire_job_slot(user_id):
+    """Acquire both per-user and global processing capacity without unbounded work."""
+    user_sem = get_user_job_semaphore(user_id)
+    if user_sem.locked():
+        return None
+    if _GLOBAL_JOB_SEMAPHORE.locked():
+        return None
+    await user_sem.acquire()
+    try:
+        await _GLOBAL_JOB_SEMAPHORE.acquire()
+    except Exception:
+        user_sem.release()
+        raise
+    return user_sem
+
+def release_job_slot(user_sem):
+    if user_sem is not None:
+        user_sem.release()
+    _GLOBAL_JOB_SEMAPHORE.release()
+
+def _hostname_is_private_or_local(hostname):
+    """Reject obvious SSRF targets before yt-dlp is allowed to fetch a URL."""
+    host = (hostname or "").strip().rstrip(".").lower()
+    if not host or host in {"localhost", "localhost.localdomain"}:
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+        for info in infos:
+            addr = info[4][0]
+            ip = ipaddress.ip_address(addr)
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+                return True
+    except (socket.gaierror, ValueError, OSError):
+        return False
+    return False
+
+def validate_public_url(value):
+    """Validate an HTTP(S) URL and reject credentials, malformed hosts and obvious private targets."""
+    value = (value or "").strip()
+    if len(value) > SECURITY_MAX_URL_LENGTH:
+        raise ValueError(f"URL is too long. Maximum allowed length is {SECURITY_MAX_URL_LENGTH} characters.")
+    try:
+        parsed = urlparse(value)
+    except Exception as exc:
+        raise ValueError("Invalid URL.") from exc
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Only public http:// or https:// URLs are allowed.")
+    if parsed.username or parsed.password:
+        raise ValueError("URLs containing embedded username/password are not allowed.")
+    if _hostname_is_private_or_local(parsed.hostname):
+        raise ValueError("Private, local or reserved network addresses are not allowed.")
+    return value
 
 
 async def myid_command(update, context):
@@ -1081,9 +1192,23 @@ async def maintenance_guard(update, context):
     if not user:
         return
 
+    # Reject oversized text before any feature handler sees it.
+    msg = update.effective_message
+    if msg and msg.text and len(msg.text) > SECURITY_MAX_INPUT_CHARS:
+        await msg.reply_text("⚠️ Message is too long. Please send a shorter input.")
+        raise ApplicationHandlerStop
+
     # Admins always retain access, including while maintenance mode is ON.
     if is_admin(user.id):
         return
+
+    # Layered anti-abuse control: identity-bound sliding-window limit.
+    if not security_allow(user.id):
+        if msg:
+            await msg.reply_text("⏳ Too many requests. Please wait a little and try again.")
+        elif update.callback_query:
+            await update.callback_query.answer("⏳ Too many requests. Please wait a little.", show_alert=True)
+        raise ApplicationHandlerStop
 
     row = get_user_by_id(user.id)
     if row and row[9]:
@@ -1510,12 +1635,206 @@ async def audio_extract_command(update, context):
     await update.effective_message.reply_text(
         "🎵 <b>VIDEO → AUDIO</b>\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "🎬 Send me a video file and I will extract its audio as MP3.\n"
-        "🎧 The original video will not be changed.\n"
+        "🎬 Send a video file <b>or paste a video link</b>.\n"
+        "🎧 I will extract the audio and return it as MP3.\n"
+        "🌐 Links use yt-dlp site extractors + its generic web extractor for maximum coverage.\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
-        "Supported: MP4 • MKV • MOV • WebM • AVI • M4V and more",
+        "📁 Files: MP4 • MKV • MOV • WebM • AVI • M4V and more\n"
+        "🔗 Links: public video pages, embeds and direct media URLs",
         parse_mode="HTML", reply_markup=audio_extract_keyboard()
     )
+
+
+def is_http_url(value):
+    try:
+        validate_public_url(value)
+        return True
+    except Exception:
+        return False
+
+
+def _video_platform_hint(url):
+    """Return a friendly platform hint for common public video hosts."""
+    try:
+        host = (urlparse(url).netloc or "").lower().split(":", 1)[0]
+    except Exception:
+        return "other"
+    if host == "youtu.be" or host.endswith("youtube.com") or host.endswith("youtube-nocookie.com"):
+        return "youtube"
+    if host.endswith("tiktok.com") or host in {"vm.tiktok.com", "vt.tiktok.com"}:
+        return "tiktok"
+    if host.endswith("instagram.com") or host in {"instagr.am", "instagram.com"}:
+        return "instagram"
+    return "other"
+
+
+def download_audio_from_url(url, temp_dir):
+    """Extract audio from public video links with platform-aware yt-dlp retries.
+
+    YouTube, TikTok and Instagram get explicit first-class attempts, while the normal
+    yt-dlp extractor registry and generic extractor remain the fallback for other
+    public video sites. This does not bypass login, DRM, CAPTCHA or access controls.
+    """
+    output_template = os.path.join(temp_dir, "source_audio.%(ext)s")
+    platform = _video_platform_hint(url)
+
+    base = {
+        "outtmpl": output_template,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "no_color": True,
+        "socket_timeout": 60,
+        "retries": 5,
+        "fragment_retries": 5,
+        "extractor_retries": 5,
+        "file_access_retries": 3,
+        "http_chunk_size": 0,
+        "concurrent_fragment_downloads": 4,
+        "continuedl": True,
+        "overwrites": True,
+        "windowsfilenames": True,
+        "restrictfilenames": False,
+        "ignoreerrors": False,
+        "check_formats": "selected",
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }],
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/140.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+    }
+
+    # First-class routes for the three platforms the bot advertises most often.
+    # These still use yt-dlp's official extractors; they are not custom scrapers.
+    attempts = []
+    if platform in {"youtube", "tiktok", "instagram"}:
+        primary = dict(base)
+        primary["format"] = "bestaudio/best"
+        attempts.append(primary)
+
+        # Some posts expose a combined A/V format but no standalone audio format.
+        combined = dict(base)
+        combined["format"] = "best[ext=mp4]/best"
+        combined["retries"] = 3
+        combined["fragment_retries"] = 3
+        attempts.append(combined)
+    else:
+        normal = dict(base)
+        normal["format"] = "bestaudio/best"
+        attempts.append(normal)
+
+    # Broad fallback for every other public host, including pages that embed a
+    # supported service. yt-dlp documents the generic extractor for this purpose.
+    generic = dict(base)
+    generic["format"] = "bestaudio/best"
+    generic["force_generic_extractor"] = True
+    generic["retries"] = 3
+    generic["fragment_retries"] = 3
+    attempts.append(generic)
+
+    last_error = None
+    for attempt in attempts:
+        try:
+            with yt_dlp.YoutubeDL(attempt) as ydl:
+                info = ydl.extract_info(url, download=True)
+            mp3_path = os.path.join(temp_dir, "source_audio.mp3")
+            if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 0:
+                return mp3_path, info
+            last_error = RuntimeError("Audio file was not created after downloading the video link.")
+        except Exception as exc:
+            last_error = exc
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("Audio extraction failed for this video link.")
+
+
+async def process_audio_url(update, context, url):
+    """Download audio from a video URL, convert it to MP3, and send it to Telegram."""
+    user_id = update.effective_user.id
+    temp_dir = tempfile.mkdtemp(prefix=f"audio_url_{user_id}_")
+    msg = await update.effective_message.reply_text(
+        "🔗 <b>VIDEO LINK → AUDIO</b>\n\n"
+        "<code>░░░░░░░░░░</code> <b>0%</b>\n\n"
+        "🔍 Checking video link...",
+        parse_mode="HTML"
+    )
+
+    async def progress(percent, stage):
+        try:
+            await msg.edit_text(
+                f"🔗 <b>VIDEO LINK → AUDIO</b>\n\n<code>{make_progress_bar(percent)}</code> <b>{percent}%</b>\n\n{stage}",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+    job_slot = None
+    try:
+        url = validate_public_url(url)
+        if not shutil.which("ffmpeg"):
+            raise RuntimeError("FFmpeg is not installed on the server.")
+        job_slot = await acquire_job_slot(user_id)
+        if job_slot is None:
+            raise RuntimeError("This bot is busy processing other requests. Please wait a moment and try again.")
+
+        await progress(10, "🔍 Checking supported video source...")
+        await progress(25, "📥 Downloading the best available audio stream...")
+        mp3_path, info = await asyncio.to_thread(download_audio_from_url, url, temp_dir)
+        await progress(80, "🎧 Converting audio to MP3...")
+
+        size = os.path.getsize(mp3_path)
+        if size > 50 * 1024 * 1024:
+            raise RuntimeError("The extracted MP3 is larger than Telegram's 50 MB bot upload limit.")
+
+        title = str((info or {}).get("title") or "Extracted Audio").strip()
+        title = title[:64] or "Extracted Audio"
+        safe_stem = "".join(ch for ch in title if ch not in '<>:/\\|?*\"').strip()[:80] or "extracted_audio"
+        output_filename = f"{safe_stem}.mp3"
+
+        await progress(95, "📤 Sending MP3 to Telegram...")
+        with open(mp3_path, "rb") as fh:
+            input_file = InputFile(fh, filename=output_filename, read_file_handle=True)
+            await update.effective_message.reply_audio(
+                audio=input_file,
+                filename=output_filename,
+                title=title,
+                caption=f"🎵 <b>Audio extracted from video link</b>\n💾 {size/1024/1024:.2f} MB",
+                parse_mode="HTML"
+            )
+
+        try:
+            await msg.delete()
+        except Exception:
+            await progress(100, "✅ <b>Completed!</b>")
+        log_activity(user_id, "video_to_audio_link")
+    except Exception as exc:
+        print("Audio URL Extract Error:", repr(exc))
+        detail = str(exc).strip()
+        if "Unsupported URL" in detail or "not a valid URL" in detail:
+            detail = "This video link is not supported or could not be resolved."
+        try:
+            await msg.edit_text(
+                "❌ <b>Could not extract audio from this link.</b>\n\n"
+                f"<code>{html.escape(detail[:1200])}</code>\n\n"
+                "💡 The link must be publicly accessible. Login-only, DRM-protected, CAPTCHA/geo-blocked or newly changed sites may still fail.",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+    finally:
+        release_job_slot(job_slot)
+        context.user_data["audio_extract_mode"] = True
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 async def process_audio_extract(update, context):
@@ -1603,6 +1922,13 @@ async def process_audio_extract(update, context):
             await progress(0, "❌ Please send a video file.", force=True)
             return
 
+        known_size = getattr(media, "file_size", None)
+        if known_size and known_size > SECURITY_MAX_UPLOAD_MB * 1024 * 1024:
+            raise RuntimeError(f"Video file is too large. Maximum allowed is {SECURITY_MAX_UPLOAD_MB} MB.")
+        job_slot = await acquire_job_slot(user_id)
+        if job_slot is None:
+            raise RuntimeError("This bot is busy processing other requests. Please wait a moment and try again.")
+
         filename = (getattr(media, "file_name", None) or "video.mp4")
         filename_lower = filename.lower()
         mime = (getattr(media, "mime_type", None) or "").lower()
@@ -1613,6 +1939,8 @@ async def process_audio_extract(update, context):
         await progress(10, "📥 Downloading video...", force=True)
         tg_file = await context.bot.get_file(media.file_id)
         await tg_file.download_to_drive(src)
+        if os.path.getsize(src) > SECURITY_MAX_UPLOAD_MB * 1024 * 1024:
+            raise RuntimeError(f"Video file is too large. Maximum allowed is {SECURITY_MAX_UPLOAD_MB} MB.")
         await progress(30, "🔍 Reading video stream...", force=True)
 
         duration = await probe_duration(src)
@@ -1674,6 +2002,7 @@ async def process_audio_extract(update, context):
         except Exception:
             pass
     finally:
+        release_job_slot(job_slot)
         # Keep the tool active so another video can be sent immediately.
         context.user_data["audio_extract_mode"] = True
         try:
@@ -2351,7 +2680,12 @@ async def handle_tiktok_link(
     # URL CHECK
     # ==========================================
 
-    if not is_tiktok_url(url):
+    try:
+        url = validate_public_url(url)
+    except ValueError:
+        url = ""
+
+    if not url or not is_tiktok_url(url):
 
         await update.message.reply_text(
             "❌ **Invalid TikTok link.**\n\n"
@@ -2372,7 +2706,12 @@ async def handle_tiktok_link(
         parse_mode="Markdown"
     )
 
+    job_slot = None
     try:
+        job_slot = await acquire_job_slot(update.effective_user.id)
+        if job_slot is None:
+            await checking_message.edit_text("⏳ Too many active downloads for your account. Please wait for the current job to finish.", parse_mode="Markdown")
+            return
 
         # yt-dlp can block the bot while extracting.
         # Run it in another thread.
@@ -2491,6 +2830,10 @@ async def handle_tiktok_link(
         )
 
 
+    finally:
+        release_job_slot(job_slot)
+
+
 # ==================================================
 # TIKTOK QUALITY HANDLER
 # ==================================================
@@ -2576,6 +2919,10 @@ async def handle_tiktok_quality(
     )
 
     user_id = update.message.from_user.id
+    job_slot = await acquire_job_slot(user_id)
+    if job_slot is None:
+        await downloading_message.edit_text("⏳ Too many active downloads for your account. Please wait for the current job to finish.", parse_mode="Markdown")
+        return
 
     output_path = os.path.join(
         os.getcwd(),
@@ -2721,6 +3068,7 @@ async def handle_tiktok_quality(
         )
 
     finally:
+        release_job_slot(job_slot)
 
         # ==========================================
         # DELETE TEMPORARY VIDEO
@@ -2767,6 +3115,27 @@ async def handle_text(
     if await ui_text_action(update, context, text):
         return
     if await support_message(update, context):
+        return
+
+    # VIDEO → AUDIO: accept a public video page/direct video URL as well as
+    # uploaded files. URL handling comes before downloader state so a link
+    # pasted while Audio mode is active is treated as an audio request.
+    if context.user_data.get("audio_extract_mode") and is_http_url(text):
+        await process_audio_url(update, context, text)
+        return
+
+    if context.user_data.get("audio_extract_mode") and text.startswith(("http://", "https://")):
+        await update.message.reply_text(
+            "❌ <b>Invalid video link.</b>\n\nPlease send a complete http:// or https:// video URL.",
+            parse_mode="HTML"
+        )
+        return
+
+    if context.user_data.get("audio_extract_mode") and text:
+        await update.message.reply_text(
+            "🎵 <b>VIDEO → AUDIO</b>\n\nPlease send a video file or paste a public video link.",
+            parse_mode="HTML"
+        )
         return
 
     if context.user_data.get("image_waiting_size"):

@@ -1293,8 +1293,10 @@ async def image_callback(update, context):
         op = operations[d]
         context.user_data["image_mode"] = op
         if op == "resize":
+            context.user_data["image_waiting_size"] = True
+            context.user_data["image_resize_target"] = None
             await query.edit_message_text(
-                "📐 <b>RESIZE IMAGE</b>\n\nSend the target size first, like:\n<code>1280x720</code>\nThen send the image.\n\nThe image will be resized to fit inside those dimensions while keeping its aspect ratio.",
+                "📐 <b>RESIZE IMAGE</b>\n\nSend the target size first, like:\n<code>1280x720</code>\nThen send the image.\n\nThe result will be resized to the exact dimensions you enter.",
                 parse_mode="HTML", reply_markup=image_mode_keyboard()
             )
         else:
@@ -1316,73 +1318,140 @@ def parse_resize(text):
 
 async def process_image(update, context):
     mode = context.user_data.get("image_mode")
-    if not mode or mode == "menu":
+    if mode not in {"compress", "resize", "jpg", "png", "webp", "crop"}:
         await image_tools_command(update, context)
         return
-    msg = await update.effective_message.reply_text("🖼️ Processing image…")
+
     user_id = update.effective_user.id
     temp_dir = tempfile.mkdtemp(prefix=f"img_{user_id}_")
     src = os.path.join(temp_dir, f"source_{uuid.uuid4().hex}")
     out = None
+    msg = await update.effective_message.reply_text(
+        "🖼️ <b>IMAGE TOOLS</b>\n\n"
+        "<code>░░░░░░░░░░</code> <b>0%</b>\n\n"
+        "⏳ Starting...",
+        parse_mode="HTML"
+    )
+
+    async def progress(percent, stage):
+        bar = make_progress_bar(percent)
+        try:
+            await msg.edit_text(
+                f"🖼️ <b>IMAGE TOOLS</b>\n\n"
+                f"<code>{bar}</code> <b>{percent}%</b>\n\n{stage}",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
     try:
         media = update.message.photo[-1] if update.message.photo else update.message.document
-        if not media or not (update.message.photo or (update.message.document.mime_type or "").startswith("image/")):
-            await msg.edit_text("❌ Please send a valid image.")
+        if not media:
+            await progress(0, "❌ Invalid image.")
             return
+
+        # Telegram's document MIME can occasionally be absent/wrong. Pillow
+        # validates the actual bytes below, so accept an image document here.
+        if update.message.document and not (update.message.document.mime_type or "").startswith("image/"):
+            name = (update.message.document.file_name or "").lower()
+            if not name.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff")):
+                await progress(0, "❌ Please send a JPG, PNG, WebP, GIF, BMP or TIFF image.")
+                return
+
+        await progress(10, "📥 Downloading image...")
         file = await context.bot.get_file(media.file_id)
         await file.download_to_drive(src)
-        with Image.open(src) as im:
-            im.load()
-            original_size = im.size
-            if mode == "resize":
-                target = context.user_data.get("image_resize_target")
-                if not target:
-                    await msg.edit_text("📐 Send the target size first, for example: <code>1280x720</code>", parse_mode="HTML")
-                    context.user_data["image_waiting_size"] = True
-                    return
-                tw, th = target
-                image = ImageOps.contain(im, (tw, th), Image.Resampling.LANCZOS)
-                ext, fmt, mime = "png", "PNG", "image/png"
-                if im.mode in ("RGB", "L"):
-                    ext, fmt, mime = "jpg", "JPEG", "image/jpeg"
-                    image = image.convert("RGB")
-            elif mode == "compress":
-                image = im.copy()
-                if image.mode not in ("RGB", "L"):
-                    image = image.convert("RGB")
-                ext, fmt, mime = "jpg", "JPEG", "image/jpeg"
-            elif mode == "crop":
-                image = ImageOps.fit(im, (min(im.size), min(im.size)), method=Image.Resampling.LANCZOS, centering=(0.5,0.5))
-                if image.mode not in ("RGB", "L"):
-                    image = image.convert("RGB")
-                ext, fmt, mime = "jpg", "JPEG", "image/jpeg"
-            else:
-                image = im.copy()
-                if mode == "jpg":
-                    if image.mode not in ("RGB", "L"):
+        await progress(30, "🔍 Reading image...")
+
+        target = context.user_data.get("image_resize_target") if mode == "resize" else None
+        if mode == "resize" and not target:
+            await progress(0, "📐 Size is missing. Send a size like <code>1280x720</code>.")
+            context.user_data["image_waiting_size"] = True
+            return
+
+        # Pillow work is CPU-bound; keep it off the Telegram event loop so the
+        # progress animation remains visible while large images are processed.
+        def transform_image():
+            with Image.open(src) as im:
+                im.load()
+                original_size = im.size
+                original_mode = im.mode
+
+                if mode == "resize":
+                    tw, th = target
+                    image = im.resize((tw, th), Image.Resampling.LANCZOS)
+                    ext, fmt = "png", "PNG"
+                    if image.mode in ("RGB", "L"):
                         image = image.convert("RGB")
-                    ext, fmt, mime = "jpg", "JPEG", "image/jpeg"
+                        ext, fmt = "jpg", "JPEG"
+                elif mode == "compress":
+                    # Preserve transparency by using WebP for RGBA/P modes.
+                    if "A" in im.getbands() or im.mode == "P":
+                        image = im.convert("RGBA")
+                        ext, fmt = "webp", "WEBP"
+                    else:
+                        image = im.convert("RGB") if im.mode not in ("RGB", "L") else im.copy()
+                        ext, fmt = "jpg", "JPEG"
+                elif mode == "crop":
+                    side = min(im.size)
+                    image = ImageOps.fit(im, (side, side), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+                    if "A" in image.getbands():
+                        image = image.convert("RGBA")
+                        ext, fmt = "png", "PNG"
+                    else:
+                        image = image.convert("RGB")
+                        ext, fmt = "jpg", "JPEG"
+                elif mode == "jpg":
+                    image = im.convert("RGB") if im.mode not in ("RGB", "L") else im.copy()
+                    ext, fmt = "jpg", "JPEG"
                 elif mode == "png":
-                    ext, fmt, mime = "png", "PNG", "image/png"
+                    image = im.convert("RGBA") if "A" in im.getbands() else im.convert("RGB")
+                    ext, fmt = "png", "PNG"
                 else:
-                    ext, fmt, mime = "webp", "WEBP", "image/webp"
-                    if image.mode not in ("RGB", "RGBA", "L"):
-                        image = image.convert("RGB")
-            out = os.path.join(temp_dir, f"result_{uuid.uuid4().hex}.{ext}")
-            save_kwargs = {"optimize": True}
-            if fmt == "JPEG": save_kwargs.update(quality=72, progressive=True)
-            elif fmt == "WEBP": save_kwargs.update(quality=80, method=6)
-            image.save(out, format=fmt, **save_kwargs)
+                    image = im.convert("RGBA") if "A" in im.getbands() else im.convert("RGB")
+                    ext, fmt = "webp", "WEBP"
+
+                path = os.path.join(temp_dir, f"result_{uuid.uuid4().hex}.{ext}")
+                save_kwargs = {"optimize": True}
+                if fmt == "JPEG":
+                    save_kwargs.update(quality=82, progressive=True)
+                elif fmt == "WEBP":
+                    save_kwargs.update(quality=82, method=6)
+                image.save(path, format=fmt, **save_kwargs)
+                image.close()
+                return path, original_size, original_mode, fmt, ext
+
+        await progress(45, "🧩 Processing image...")
+        out, original_size, original_mode, fmt, ext = await asyncio.to_thread(transform_image)
+        await progress(80, "✨ Optimizing result...")
+
         before = os.path.getsize(src)
         after = os.path.getsize(out)
-        await msg.edit_text(f"✅ <b>Done!</b>\n\n📏 {original_size[0]}×{original_size[1]}\n💾 {before/1024:.1f} KB → {after/1024:.1f} KB", parse_mode="HTML")
+        await progress(95, "📤 Preparing result...")
+
+        caption = (
+            f"🖼️ <b>Image Tools • {mode.upper()}</b>\n"
+            f"📐 {original_size[0]}×{original_size[1]}\n"
+            f"💾 {before/1024:.1f} KB → {after/1024:.1f} KB"
+        )
         with open(out, "rb") as fh:
-            await update.effective_message.reply_document(document=fh, filename=os.path.basename(out), caption="🖼️ Image Tools • Completed")
+            await update.effective_message.reply_document(
+                document=fh,
+                filename=os.path.basename(out),
+                caption=caption,
+                parse_mode="HTML"
+            )
+
+        await progress(100, "✅ <b>Completed!</b>")
         log_activity(user_id, "image_tool", mode)
     except Exception as exc:
         print("Image Tool Error:", repr(exc))
         try:
-            await msg.edit_text("❌ <b>Image processing failed.</b>\n\nPlease try another image.", parse_mode="HTML")
+            await msg.edit_text(
+                "❌ <b>Image processing failed.</b>\n\n"
+                f"<code>{html.escape(type(exc).__name__ + ': ' + str(exc))}</code>",
+                parse_mode="HTML"
+            )
         except Exception:
             pass
     finally:
@@ -1391,7 +1460,9 @@ async def process_image(update, context):
         context.user_data["image_waiting_size"] = False
         try:
             for name in os.listdir(temp_dir):
-                os.remove(os.path.join(temp_dir, name))
+                path = os.path.join(temp_dir, name)
+                if os.path.isfile(path):
+                    os.remove(path)
             os.rmdir(temp_dir)
         except OSError:
             pass

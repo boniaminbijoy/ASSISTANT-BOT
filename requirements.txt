@@ -8,3 +8,6 @@ pyzbar
 --pre
 yt-dlp[default,curl-cffi]
 curl-cffi==0.16.0
+
+# Optional YouTube PO-token provider plugin; activates automatically when a compatible JS runtime/provider is available.
+bgutil-ytdlp-pot-provider==2.0.0

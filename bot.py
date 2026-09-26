@@ -1671,9 +1671,10 @@ def _video_platform_hint(url):
 def download_audio_from_url(url, temp_dir):
     """Extract audio from public video links with platform-aware yt-dlp retries.
 
-    YouTube, TikTok and Instagram get explicit first-class attempts, while the normal
-    yt-dlp extractor registry and generic extractor remain the fallback for other
-    public video sites. This does not bypass login, DRM, CAPTCHA or access controls.
+    YouTube gets additional player-client fallbacks because YouTube currently
+    enforces different bot/PO-token rules per client. Optional cookies can be
+    supplied through YOUTUBE_COOKIES_FILE (a server-side Netscape cookie file);
+    the bot never asks users to upload account cookies in chat.
     """
     output_template = os.path.join(temp_dir, "source_audio.%(ext)s")
     platform = _video_platform_hint(url)
@@ -1713,27 +1714,68 @@ def download_audio_from_url(url, temp_dir):
         },
     }
 
-    # First-class routes for the three platforms the bot advertises most often.
-    # These still use yt-dlp's official extractors; they are not custom scrapers.
+    # Optional server-side YouTube cookies. Never expose this value to users
+    # and never accept cookie files uploaded through Telegram.
+    cookie_file = os.environ.get("YOUTUBE_COOKIES_FILE", "").strip()
+    if cookie_file and os.path.isfile(cookie_file):
+        base["cookiefile"] = cookie_file
+
     attempts = []
-    if platform in {"youtube", "tiktok", "instagram"}:
+
+    if platform == "youtube":
+        # YouTube's current client-specific rules make a single player client
+        # brittle. Try clients that can work without account cookies/PO tokens
+        # before falling back to the default extractor configuration.
+        youtube_clients = [
+            ("android_vr", False),
+            ("tv", False),
+            ("web_embedded", False),
+            ("web_safari", False),
+            ("web", False),
+        ]
+        for client, skip_webpage in youtube_clients:
+            attempt = dict(base)
+            attempt["format"] = "bestaudio/best"
+            attempt["extractor_args"] = {
+                "youtube": {
+                    "player_client": [client],
+                }
+            }
+            if skip_webpage:
+                attempt["extractor_args"]["youtube"]["player_skip"] = ["webpage"]
+            attempts.append(attempt)
+
+        # Last YouTube attempt: let yt-dlp choose its current default clients,
+        # which allows future yt-dlp releases to fix extractor behavior without
+        # requiring a bot code change.
+        default_youtube = dict(base)
+        default_youtube["format"] = "bestaudio/best"
+        attempts.append(default_youtube)
+
+        combined = dict(base)
+        combined["format"] = "best[ext=mp4]/best"
+        combined["extractor_args"] = {"youtube": {"player_client": ["android_vr", "tv", "web_embedded"]}}
+        combined["retries"] = 3
+        combined["fragment_retries"] = 3
+        attempts.append(combined)
+
+    elif platform in {"tiktok", "instagram"}:
         primary = dict(base)
         primary["format"] = "bestaudio/best"
         attempts.append(primary)
 
-        # Some posts expose a combined A/V format but no standalone audio format.
         combined = dict(base)
         combined["format"] = "best[ext=mp4]/best"
         combined["retries"] = 3
         combined["fragment_retries"] = 3
         attempts.append(combined)
+
     else:
         normal = dict(base)
         normal["format"] = "bestaudio/best"
         attempts.append(normal)
 
-    # Broad fallback for every other public host, including pages that embed a
-    # supported service. yt-dlp documents the generic extractor for this purpose.
+    # Generic fallback for public hosts and embedded supported services.
     generic = dict(base)
     generic["format"] = "bestaudio/best"
     generic["force_generic_extractor"] = True

@@ -273,3 +273,9 @@ The included Dockerfile installs FFmpeg and the required system packages.
   - `SECURITY_MAX_CONCURRENT_JOBS` (default 2/user)
   - `SECURITY_GLOBAL_JOB_LIMIT` (default 6)
 - These controls are defensive limits; they do not bypass Telegram, platform authentication, DRM, CAPTCHA, or access controls.
+
+
+### YouTube extraction hardening
+- YouTube links use multiple yt-dlp player-client fallbacks (`android_vr`, `tv`, `web_embedded`, `web_safari`, `web`) before the normal extractor fallback.
+- Optional server-side YouTube cookies can be provided with `YOUTUBE_COOKIES_FILE`; never upload account cookies through Telegram.
+- YouTube may still reject requests based on IP/account/PO-token requirements. The bot does not bypass access controls.

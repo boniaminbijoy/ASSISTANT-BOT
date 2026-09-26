@@ -1,8 +1,13 @@
+## V48 — Video → Audio Removed
+
+- Removed the Video → Audio tool from the Home UI.
+- Removed `/audioextract` and its callback/media handlers.
+- Removed the Video → Audio state and processing code.
+- TikTok Downloader, Image Tools, QR tools, account features, admin tools, and monitoring remain unchanged.
+
 # 🤖 Assistant Bot — V43
 
-A Telegram all-in-one utility bot with downloader, QR tools, Image Tools, Video → Audio extraction, user account features, admin controls, support, broadcasts, scheduled tasks, monitoring, and recovery helpers.
 
-## ✨ V43 — Video Link → Audio Upgrade
 
 ### 🖼️ Image Tools fixes
 - After an Image Tool operation finishes, the selected operation stays active.
@@ -12,16 +17,12 @@ A Telegram all-in-one utility bot with downloader, QR tools, Image Tools, Video 
 - Unrelated video/document messages are no longer incorrectly routed through QR/Image Tools.
 - QR mode is not triggered by Image Tools media accidentally.
 
-### 🎵 Video → Audio improvements
 - Added real FFmpeg extraction progress updates while the audio is being processed.
 - Progress now moves through download → read → extraction → finalization instead of staying at a single extraction percentage.
 - Uses `ffprobe` to estimate video duration and calculate extraction progress when available.
 - Explicitly selects the first audio stream and gives a clear error when no readable audio track exists.
 - Temporary processing files are cleaned up safely after success or failure.
 
-### 🎵 Video → Audio
-- New Home menu: **🎵 Video To Audio**
-- Command: `/audioextract`
 - Send a video file **or paste a video link** and the bot extracts its audio as **MP3**.
 - Link mode uses yt-dlp site extractors plus its generic extractor for broad public-web coverage, then FFmpeg converts the audio to MP3.
 - Supports common video containers such as MP4, MKV, MOV, WebM, AVI, M4V, 3GP, FLV, TS and MTS.
@@ -33,7 +34,6 @@ A Telegram all-in-one utility bot with downloader, QR tools, Image Tools, Video 
 - Re-checked Python syntax with `python -m py_compile`.
 - Re-checked Image Tools routing so image/video documents are handled only by the active tool mode.
 - Image Tools keep the selected operation active after a successful result and remove temporary progress UI.
-- Video → Audio keeps its mode active for consecutive videos.
 - Polling, error handling, and recovery code remain compatible with the current `python-telegram-bot` application lifecycle.
 
 
@@ -60,7 +60,6 @@ There is no bot-side implementation required to make Telegram's official bot ad 
   - PNG
   - WebP
   - Crop Square
-- 🎵 Video → Audio (MP3)
 - 🤖 More Bots
 - 👤 Profile / Statistics / History
 - 🆘 User → Admin Support
@@ -71,14 +70,6 @@ There is no bot-side implementation required to make Telegram's official bot ad 
 - 📊 Dashboard / reports
 - 🔧 Maintenance controls
 - ❤️ Health / recovery monitoring
-
-## 🎵 Video → Audio Usage
-
-1. Open **🎵 Video To Audio** from Home, or use `/audioextract`.
-2. Send a video.
-3. Wait for the extraction progress.
-4. The bot returns the extracted audio as an MP3.
-5. Send another video immediately if needed.
 
 ### FFmpeg
 The Docker image installs FFmpeg automatically, so no manual FFmpeg installation is required when deploying with the included `Dockerfile`.
@@ -104,7 +95,6 @@ For Resize:
 - `/history` — History
 - `/morebots` — More Bots
 - `/imagetools` — Image Tools
-- `/audioextract` — Video → Audio
 - `/support` — Contact Admin
 - `/myid` — Show Telegram user ID
 
@@ -150,7 +140,6 @@ BOT_DB_PATH=bot_data.db
 3. Set `BOT_TOKEN` in Render Environment Variables.
 4. Set `ADMIN_IDS` with comma-separated Telegram numeric IDs.
 5. Deploy.
-6. Confirm `/start`, Image Tools and `/audioextract` work.
 
 The included Dockerfile installs FFmpeg and the required system packages.
 
@@ -167,20 +156,6 @@ The included Dockerfile installs FFmpeg and the required system packages.
 - [ ] Image Tools does not ask to select QR Scanner
 - [ ] QR Scanner still works when explicitly selected
 
-### Video → Audio link coverage
-- Uses the current yt-dlp extractor library rather than a hard-coded platform list. yt-dlp includes many site-specific extractors and also a generic extractor for additional pages/embeds.
-- A public URL is required. Private/login-only videos, DRM-protected streams, CAPTCHA challenges, geo-restricted content, or a site that has recently changed can still be unavailable.
-- The bot does not bypass DRM, authentication, or access controls.
-
-### Video → Audio
-- [ ] Open from Home
-- [ ] `/audioextract` works with an uploaded video
-- [ ] `/audioextract` works with a supported public video URL
-- [ ] MP4 with audio → MP3
-- [ ] Send a second video immediately after the first
-- [ ] Video without audio shows a useful error
-- [ ] Unsupported document does not trigger audio extraction
-
 ### Admin / Core
 - [ ] `/admin`
 - [ ] `/status`
@@ -193,7 +168,6 @@ The included Dockerfile installs FFmpeg and the required system packages.
 ## 📝 Version History
 
 ### V43
-- Upgraded Video → Audio to accept supported public video links in addition to uploaded video files.
 - Added yt-dlp link extraction with retries and FFmpeg MP3 conversion.
 - Added a Telegram 50 MB output-size guard for MP3 uploads.
 
@@ -203,7 +177,6 @@ The included Dockerfile installs FFmpeg and the required system packages.
 - Confirmed the bot does not implement fake/custom ad-gates or ad-watch verification.
 
 ### V41
-- Added live FFmpeg/FFprobe extraction progress for Video → Audio.
 - Added safer first-audio-stream mapping and temporary-file cleanup.
 - Re-audited Image Tools routing, repeated processing, polling/error handling, and syntax.
 - Synchronized README with the V41 code.
@@ -212,10 +185,6 @@ The included Dockerfile installs FFmpeg and the required system packages.
 - Fixed Image Tools session reset after successful processing.
 - Removed completed Image Tools progress messages.
 - Improved repeated-image workflow.
-- Added Video → Audio MP3 extractor using FFmpeg.
-- Added Video → Audio link support using yt-dlp + FFmpeg.
-- Added `/audioextract`.
-- Added Home menu button for Video → Audio.
 - Updated command menu and documentation.
 
 ### V39
@@ -244,14 +213,12 @@ The included Dockerfile installs FFmpeg and the required system packages.
 
 ## ⚠️ Notes
 
-- FFmpeg is required for Video → Audio and is installed by the included Dockerfile.
 - Large videos can take longer to download and process.
 - Telegram file-size and Bot API limits still apply.
 - Only one polling instance should use the same bot token at a time.
 - Render Free service sleep/restart behavior is separate from application-level recovery logic.
 
 
-### Video Link → Audio coverage
 - YouTube, TikTok and Instagram receive dedicated yt-dlp retry/format handling.
 - Other public video hosts use yt-dlp site-specific extractors and a generic extractor fallback.
 - Private/login-only, DRM-protected, CAPTCHA/geo-blocked content or sites that recently changed can still fail; the bot does not bypass access controls.
@@ -261,7 +228,6 @@ The included Dockerfile installs FFmpeg and the required system packages.
 - Added per-user and global concurrent-job limits to reduce resource exhaustion.
 - Added maximum text/URL length controls.
 - Added public URL validation that rejects embedded credentials and obvious private/local/reserved network targets before yt-dlp processing.
-- Added Telegram media size guard before and after download for Video → Audio.
 - Kept temporary-file cleanup in `finally` blocks.
 - Security controls are configurable with environment variables:
   - `SECURITY_RATE_WINDOW` (default 60 seconds)
@@ -275,7 +241,5 @@ The included Dockerfile installs FFmpeg and the required system packages.
 - These controls are defensive limits; they do not bypass Telegram, platform authentication, DRM, CAPTCHA, or access controls.
 
 
-### YouTube extraction hardening
 - YouTube links use multiple yt-dlp player-client fallbacks (`android_vr`, `tv`, `web_embedded`, `web_safari`, `web`) before the normal extractor fallback.
-- Optional server-side YouTube cookies can be provided with `YOUTUBE_COOKIES_FILE`; never upload account cookies through Telegram.
 - YouTube may still reject requests based on IP/account/PO-token requirements. The bot does not bypass access controls.

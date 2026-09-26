@@ -1616,443 +1616,6 @@ async def process_image(update, context):
             pass
 
 # ==================================================
-# VIDEO → AUDIO EXTRACTOR
-# ==================================================
-
-VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".3gp", ".flv", ".ts", ".mts")
-
-
-def audio_extract_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎵 Extract Audio", callback_data="audio_extract")],
-        [InlineKeyboardButton("🏠 Home", callback_data="ui_home")],
-    ])
-
-
-async def audio_extract_command(update, context):
-    reset_modes(context)
-    context.user_data["audio_extract_mode"] = True
-    await update.effective_message.reply_text(
-        "🎵 <b>VIDEO → AUDIO</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "🎬 Send a video file <b>or paste a video link</b>.\n"
-        "🎧 I will extract the audio and return it as MP3.\n"
-        "🌐 Links use yt-dlp site extractors + its generic web extractor for maximum coverage.\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        "📁 Files: MP4 • MKV • MOV • WebM • AVI • M4V and more\n"
-        "🔗 Links: public video pages, embeds and direct media URLs",
-        parse_mode="HTML", reply_markup=audio_extract_keyboard()
-    )
-
-
-def is_http_url(value):
-    try:
-        validate_public_url(value)
-        return True
-    except Exception:
-        return False
-
-
-def _video_platform_hint(url):
-    """Return a friendly platform hint for common public video hosts."""
-    try:
-        host = (urlparse(url).netloc or "").lower().split(":", 1)[0]
-    except Exception:
-        return "other"
-    if host == "youtu.be" or host.endswith("youtube.com") or host.endswith("youtube-nocookie.com"):
-        return "youtube"
-    if host.endswith("tiktok.com") or host in {"vm.tiktok.com", "vt.tiktok.com"}:
-        return "tiktok"
-    if host.endswith("instagram.com") or host in {"instagr.am", "instagram.com"}:
-        return "instagram"
-    return "other"
-
-
-def download_audio_from_url(url, temp_dir):
-    """Extract audio from public video links with platform-aware yt-dlp retries.
-
-    YouTube gets additional player-client fallbacks because YouTube currently
-    enforces different bot/PO-token rules per client. Optional cookies can be
-    supplied through YOUTUBE_COOKIES_FILE (a server-side Netscape cookie file);
-    the bot never asks users to upload account cookies in chat.
-    """
-    output_template = os.path.join(temp_dir, "source_audio.%(ext)s")
-    platform = _video_platform_hint(url)
-
-    base = {
-        "outtmpl": output_template,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "no_color": True,
-        "socket_timeout": 60,
-        "retries": 5,
-        "fragment_retries": 5,
-        "extractor_retries": 5,
-        "file_access_retries": 3,
-        "http_chunk_size": 0,
-        "concurrent_fragment_downloads": 4,
-        "continuedl": True,
-        "overwrites": True,
-        "windowsfilenames": True,
-        "restrictfilenames": False,
-        "ignoreerrors": False,
-        "check_formats": "selected",
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }],
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/140.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        },
-    }
-
-    # Optional server-side YouTube cookies. Never expose this value to users
-    # and never accept cookie files uploaded through Telegram.
-    cookie_file = os.environ.get("YOUTUBE_COOKIES_FILE", "").strip()
-    if cookie_file and os.path.isfile(cookie_file):
-        base["cookiefile"] = cookie_file
-
-    attempts = []
-
-    if platform == "youtube":
-        # YouTube's current client-specific rules make a single player client
-        # brittle. Try clients that can work without account cookies/PO tokens
-        # before falling back to the default extractor configuration.
-        youtube_clients = [
-            ("android_vr", False),
-            ("tv", False),
-            ("web_embedded", False),
-            ("web_safari", False),
-            ("web", False),
-        ]
-        for client, skip_webpage in youtube_clients:
-            attempt = dict(base)
-            attempt["format"] = "bestaudio/best"
-            attempt["extractor_args"] = {
-                "youtube": {
-                    "player_client": [client],
-                }
-            }
-            if skip_webpage:
-                attempt["extractor_args"]["youtube"]["player_skip"] = ["webpage"]
-            attempts.append(attempt)
-
-        # Last YouTube attempt: let yt-dlp choose its current default clients,
-        # which allows future yt-dlp releases to fix extractor behavior without
-        # requiring a bot code change.
-        default_youtube = dict(base)
-        default_youtube["format"] = "bestaudio/best"
-        attempts.append(default_youtube)
-
-        combined = dict(base)
-        combined["format"] = "best[ext=mp4]/best"
-        combined["extractor_args"] = {"youtube": {"player_client": ["android_vr", "tv", "web_embedded"]}}
-        combined["retries"] = 3
-        combined["fragment_retries"] = 3
-        attempts.append(combined)
-
-    elif platform in {"tiktok", "instagram"}:
-        primary = dict(base)
-        primary["format"] = "bestaudio/best"
-        attempts.append(primary)
-
-        combined = dict(base)
-        combined["format"] = "best[ext=mp4]/best"
-        combined["retries"] = 3
-        combined["fragment_retries"] = 3
-        attempts.append(combined)
-
-    else:
-        normal = dict(base)
-        normal["format"] = "bestaudio/best"
-        attempts.append(normal)
-
-    # Generic fallback for public hosts and embedded supported services.
-    generic = dict(base)
-    generic["format"] = "bestaudio/best"
-    generic["force_generic_extractor"] = True
-    generic["retries"] = 3
-    generic["fragment_retries"] = 3
-    attempts.append(generic)
-
-    last_error = None
-    for attempt in attempts:
-        try:
-            with yt_dlp.YoutubeDL(attempt) as ydl:
-                info = ydl.extract_info(url, download=True)
-            mp3_path = os.path.join(temp_dir, "source_audio.mp3")
-            if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 0:
-                return mp3_path, info
-            last_error = RuntimeError("Audio file was not created after downloading the video link.")
-        except Exception as exc:
-            last_error = exc
-
-    if last_error:
-        raise last_error
-    raise RuntimeError("Audio extraction failed for this video link.")
-
-
-async def process_audio_url(update, context, url):
-    """Download audio from a video URL, convert it to MP3, and send it to Telegram."""
-    user_id = update.effective_user.id
-    temp_dir = tempfile.mkdtemp(prefix=f"audio_url_{user_id}_")
-    msg = await update.effective_message.reply_text(
-        "🔗 <b>VIDEO LINK → AUDIO</b>\n\n"
-        "<code>░░░░░░░░░░</code> <b>0%</b>\n\n"
-        "🔍 Checking video link...",
-        parse_mode="HTML"
-    )
-
-    async def progress(percent, stage):
-        try:
-            await msg.edit_text(
-                f"🔗 <b>VIDEO LINK → AUDIO</b>\n\n<code>{make_progress_bar(percent)}</code> <b>{percent}%</b>\n\n{stage}",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-
-    job_slot = None
-    try:
-        url = validate_public_url(url)
-        if not shutil.which("ffmpeg"):
-            raise RuntimeError("FFmpeg is not installed on the server.")
-        job_slot = await acquire_job_slot(user_id)
-        if job_slot is None:
-            raise RuntimeError("This bot is busy processing other requests. Please wait a moment and try again.")
-
-        await progress(10, "🔍 Checking supported video source...")
-        await progress(25, "📥 Downloading the best available audio stream...")
-        mp3_path, info = await asyncio.to_thread(download_audio_from_url, url, temp_dir)
-        await progress(80, "🎧 Converting audio to MP3...")
-
-        size = os.path.getsize(mp3_path)
-        if size > 50 * 1024 * 1024:
-            raise RuntimeError("The extracted MP3 is larger than Telegram's 50 MB bot upload limit.")
-
-        title = str((info or {}).get("title") or "Extracted Audio").strip()
-        title = title[:64] or "Extracted Audio"
-        safe_stem = "".join(ch for ch in title if ch not in '<>:/\\|?*\"').strip()[:80] or "extracted_audio"
-        output_filename = f"{safe_stem}.mp3"
-
-        await progress(95, "📤 Sending MP3 to Telegram...")
-        with open(mp3_path, "rb") as fh:
-            input_file = InputFile(fh, filename=output_filename, read_file_handle=True)
-            await update.effective_message.reply_audio(
-                audio=input_file,
-                filename=output_filename,
-                title=title,
-                caption=f"🎵 <b>Audio extracted from video link</b>\n💾 {size/1024/1024:.2f} MB",
-                parse_mode="HTML"
-            )
-
-        try:
-            await msg.delete()
-        except Exception:
-            await progress(100, "✅ <b>Completed!</b>")
-        log_activity(user_id, "video_to_audio_link")
-    except Exception as exc:
-        print("Audio URL Extract Error:", repr(exc))
-        detail = str(exc).strip()
-        if "Unsupported URL" in detail or "not a valid URL" in detail:
-            detail = "This video link is not supported or could not be resolved."
-        try:
-            await msg.edit_text(
-                "❌ <b>Could not extract audio from this link.</b>\n\n"
-                f"<code>{html.escape(detail[:1200])}</code>\n\n"
-                "💡 The link must be publicly accessible. Login-only, DRM-protected, CAPTCHA/geo-blocked or newly changed sites may still fail.",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-    finally:
-        release_job_slot(job_slot)
-        context.user_data["audio_extract_mode"] = True
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-async def process_audio_extract(update, context):
-    """Extract the first audio stream from a video with live FFmpeg progress."""
-    if not context.user_data.get("audio_extract_mode"):
-        await audio_extract_command(update, context)
-        return
-
-    user_id = update.effective_user.id
-    temp_dir = tempfile.mkdtemp(prefix=f"audio_{user_id}_")
-    src = os.path.join(temp_dir, f"source_{uuid.uuid4().hex}")
-    out = os.path.join(temp_dir, f"audio_{uuid.uuid4().hex}.mp3")
-    msg = await update.effective_message.reply_text(
-        "🎵 <b>VIDEO → AUDIO</b>\n\n<code>░░░░░░░░░░</code> <b>0%</b>\n\n⏳ Starting...",
-        parse_mode="HTML"
-    )
-
-    last_percent = -1
-    last_update = 0.0
-
-    async def progress(percent, stage, force=False):
-        nonlocal last_percent, last_update
-        percent = max(0, min(100, int(percent)))
-        now = time.monotonic()
-        if not force and percent != 100 and percent - last_percent < 2 and now - last_update < 1.2:
-            return
-        last_percent = percent
-        last_update = now
-        try:
-            await msg.edit_text(
-                f"🎵 <b>VIDEO → AUDIO</b>\n\n<code>{make_progress_bar(percent)}</code> <b>{percent}%</b>\n\n{stage}",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-
-    async def probe_duration(path):
-        """Return media duration in seconds, or 0 if it cannot be probed."""
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "ffprobe", "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await proc.communicate()
-            if proc.returncode == 0:
-                return max(0.0, float(stdout.decode("utf-8", "ignore").strip() or 0))
-        except Exception:
-            pass
-        return 0.0
-
-    async def read_ffmpeg_progress(proc, duration):
-        """Read FFmpeg -progress output and update Telegram without blocking."""
-        current_seconds = 0.0
-        while True:
-            line = await proc.stdout.readline()
-            if not line:
-                break
-            text = line.decode("utf-8", "ignore").strip()
-            if text.startswith("out_time_ms="):
-                try:
-                    current_seconds = max(0.0, int(text.split("=", 1)[1]) / 1_000_000)
-                except ValueError:
-                    continue
-                if duration > 0:
-                    # Reserve the first/last portions for download/finalization.
-                    pct = 45 + int(min(1.0, current_seconds / duration) * 33)
-                    await progress(pct, "🎧 Extracting audio...")
-                else:
-                    await progress(45, "🎧 Extracting audio...")
-            elif text == "progress=end":
-                break
-        return current_seconds
-
-    try:
-        if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
-            raise RuntimeError("FFmpeg/FFprobe is not installed on the server.")
-
-        message = update.effective_message
-        media = message.video or message.document
-        if not media:
-            await progress(0, "❌ Please send a video file.", force=True)
-            return
-
-        known_size = getattr(media, "file_size", None)
-        if known_size and known_size > SECURITY_MAX_UPLOAD_MB * 1024 * 1024:
-            raise RuntimeError(f"Video file is too large. Maximum allowed is {SECURITY_MAX_UPLOAD_MB} MB.")
-        job_slot = await acquire_job_slot(user_id)
-        if job_slot is None:
-            raise RuntimeError("This bot is busy processing other requests. Please wait a moment and try again.")
-
-        filename = (getattr(media, "file_name", None) or "video.mp4")
-        filename_lower = filename.lower()
-        mime = (getattr(media, "mime_type", None) or "").lower()
-        if not (message.video or mime.startswith("video/") or filename_lower.endswith(VIDEO_EXTENSIONS)):
-            await progress(0, "❌ Please send a supported video file.", force=True)
-            return
-
-        await progress(10, "📥 Downloading video...", force=True)
-        tg_file = await context.bot.get_file(media.file_id)
-        await tg_file.download_to_drive(src)
-        if os.path.getsize(src) > SECURITY_MAX_UPLOAD_MB * 1024 * 1024:
-            raise RuntimeError(f"Video file is too large. Maximum allowed is {SECURITY_MAX_UPLOAD_MB} MB.")
-        await progress(30, "🔍 Reading video stream...", force=True)
-
-        duration = await probe_duration(src)
-        await progress(45, "🎧 Extracting audio...", force=True)
-
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-i", src,
-            "-map", "0:a:0?",
-            "-vn", "-map_metadata", "-1",
-            "-codec:a", "libmp3lame", "-q:a", "2",
-            "-progress", "pipe:1", "-nostats",
-            out,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-        # FFmpeg progress is read while FFmpeg is running, so the Telegram
-        # message shows real extraction progress instead of staying at 45%.
-        stderr_task = asyncio.create_task(proc.stderr.read())
-        await read_ffmpeg_progress(proc, duration)
-        stderr = await stderr_task
-        returncode = await proc.wait()
-
-        if returncode != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
-            detail = stderr.decode("utf-8", "ignore").strip()[-900:]
-            raise RuntimeError(detail or "The video does not contain a readable audio track.")
-
-        await progress(80, "✨ Finalizing MP3...", force=True)
-        size = os.path.getsize(out)
-        await progress(95, "📤 Preparing audio...", force=True)
-
-        stem = os.path.splitext(os.path.basename(filename))[0] or "extracted_audio"
-        output_filename = f"{stem}.mp3"
-        with open(out, "rb") as fh:
-            input_file = InputFile(fh, filename=output_filename, read_file_handle=True)
-            await update.effective_message.reply_audio(
-                audio=input_file,
-                filename=output_filename,
-                title=stem[:64],
-                caption=f"🎵 <b>Audio extracted successfully</b>\n💾 {size/1024/1024:.2f} MB",
-                parse_mode="HTML"
-            )
-
-        # Remove temporary progress UI after the result is delivered.
-        try:
-            await msg.delete()
-        except Exception:
-            await progress(100, "✅ <b>Completed!</b>", force=True)
-        log_activity(user_id, "video_to_audio")
-    except Exception as exc:
-        print("Audio Extract Error:", repr(exc))
-        try:
-            await msg.edit_text(
-                "❌ <b>Audio extraction failed.</b>\n\n"
-                f"<code>{html.escape(str(exc)[:1200])}</code>\n\n"
-                "Please send another video and try again.", parse_mode="HTML"
-            )
-        except Exception:
-            pass
-    finally:
-        release_job_slot(job_slot)
-        # Keep the tool active so another video can be sent immediately.
-        context.user_data["audio_extract_mode"] = True
-        try:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        except OSError:
-            pass
-
-# ==================================================
 # MAIN MENU
 # ==================================================
 
@@ -2064,7 +1627,6 @@ def get_main_keyboard(language="en", is_admin_user=False):
         "scanner": "📷 𝗤𝗥 𝗦𝗰𝗮𝗻𝗻𝗲𝗿",
         "generator": "🔲 𝗤𝗥 𝗚𝗲𝗻𝗲𝗿𝗮𝘁𝗼𝗿",
         "image": "🖼️ 𝗜𝗺𝗮𝗴𝗲 𝗧𝗼𝗼𝗹𝘀",
-        "audio": "🎵 𝗩𝗶𝗱𝗲𝗼 𝗧𝗼 𝗔𝘂𝗱𝗶𝗼",
         "stats": "📊 𝗠𝘆 𝗦𝘁𝗮𝘁𝘀",
         "profile": "👤 𝗠𝘆 𝗣𝗿𝗼𝗳𝗶𝗹𝗲",
         "more": "🤖 𝗠𝗼𝗿𝗲 𝗕𝗼𝘁𝘀",
@@ -2080,7 +1642,7 @@ def get_main_keyboard(language="en", is_admin_user=False):
     keyboard = [
         [btn(labels["downloader"], "primary"), btn(labels["scanner"], "primary")],
         [btn(labels["generator"], "primary"), btn(labels["image"], "success")],
-        [btn(labels["audio"], "success"), btn(labels["more"], "success")],
+        [btn(labels["more"], "success")],
         [btn(labels["profile"]), btn(labels["stats"])],
         [btn(labels["history"]), btn(labels["settings"])],
         [btn(labels["help"])],
@@ -2264,8 +1826,6 @@ async def ui_text_action(update, context, text):
         await qr_generator_start(update, context); return True
     if text == "🖼️ 𝗜𝗺𝗮𝗴𝗲 𝗧𝗼𝗼𝗹𝘀":
         await image_tools_command(update, context); return True
-    if text == "🎵 𝗩𝗶𝗱𝗲𝗼 𝗧𝗼 𝗔𝘂𝗱𝗶𝗼":
-        await audio_extract_command(update, context); return True
     if text == "📊 𝗠𝘆 𝗦𝘁𝗮𝘁𝘀":
         messages, scans, generated, downloads = get_user_stats(user.id)
         msg = f"📊 *My Statistics*\n\n💬 Messages: *{messages}*\n📷 QR Scans: *{scans}*\n🔲 QR Generated: *{generated}*\n🎵 TikTok Downloads: *{downloads}*"
@@ -2307,8 +1867,6 @@ def reset_modes(context):
     context.user_data["image_mode"] = None
     context.user_data["image_waiting_size"] = False
     context.user_data["image_resize_target"] = None
-
-    context.user_data["audio_extract_mode"] = False
 
 
 # ==================================================
@@ -3159,27 +2717,6 @@ async def handle_text(
     if await support_message(update, context):
         return
 
-    # VIDEO → AUDIO: accept a public video page/direct video URL as well as
-    # uploaded files. URL handling comes before downloader state so a link
-    # pasted while Audio mode is active is treated as an audio request.
-    if context.user_data.get("audio_extract_mode") and is_http_url(text):
-        await process_audio_url(update, context, text)
-        return
-
-    if context.user_data.get("audio_extract_mode") and text.startswith(("http://", "https://")):
-        await update.message.reply_text(
-            "❌ <b>Invalid video link.</b>\n\nPlease send a complete http:// or https:// video URL.",
-            parse_mode="HTML"
-        )
-        return
-
-    if context.user_data.get("audio_extract_mode") and text:
-        await update.message.reply_text(
-            "🎵 <b>VIDEO → AUDIO</b>\n\nPlease send a video file or paste a public video link.",
-            parse_mode="HTML"
-        )
-        return
-
     if context.user_data.get("image_waiting_size"):
         target = parse_resize(text)
         if not target:
@@ -3394,14 +2931,12 @@ def main():
     app.add_handler(CommandHandler("history", user_features_command))
     app.add_handler(CommandHandler("morebots", more_bots_command))
     app.add_handler(CommandHandler("imagetools", image_tools_command))
-    app.add_handler(CommandHandler("audioextract", audio_extract_command))
     app.add_handler(CommandHandler("addbot", addbot_command))
     app.add_handler(CommandHandler("bots", bots_command))
     app.add_handler(CallbackQueryHandler(ui_callback, pattern=r"^(ui_|lang_|user_profile$|user_stats$|hist_(downloads|scans|generates|activity)$)"))
     app.add_handler(CallbackQueryHandler(admin_help_callback, pattern=r"^admin_help_[123]$"))
     app.add_handler(CallbackQueryHandler(morebot_callback, pattern=r"^morebot_(view|delete)_\d+$|^more_bots$"))
     app.add_handler(CallbackQueryHandler(image_callback, pattern=r"^image_(menu|compress|resize|convert_jpg|convert_png|convert_webp|crop)$"))
-    app.add_handler(CallbackQueryHandler(lambda u, c: audio_extract_command(u, c), pattern=r"^audio_extract$"))
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^(admin_|set_)"))
 
     # ==========================================
@@ -3433,15 +2968,6 @@ def main():
     async def handle_media_image(update, context):
         message = update.effective_message
         image_mode = context.user_data.get("image_mode")
-        audio_mode = context.user_data.get("audio_extract_mode", False)
-
-        if audio_mode and (message.video or message.document):
-            media = message.video or message.document
-            filename = (getattr(media, "file_name", None) or "").lower()
-            mime = (getattr(media, "mime_type", None) or "").lower()
-            if message.video or mime.startswith("video/") or filename.endswith(VIDEO_EXTENSIONS):
-                await process_audio_extract(update, context)
-                return
 
         if image_mode in {"compress", "resize", "jpg", "png", "webp", "crop"}:
             if message.photo or (message.document and ((message.document.mime_type or "").startswith("image/") or (message.document.file_name or "").lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff")))):
@@ -3466,11 +2992,6 @@ def main():
         # No active mode: ignore unrelated documents instead of sending a QR prompt.
         return
 
-    async def handle_video_media(update, context):
-        if context.user_data.get("audio_extract_mode"):
-            await process_audio_extract(update, context)
-
-    app.add_handler(MessageHandler(filters.VIDEO, handle_video_media))
     # Documents are broad by design: MIME types can be missing/wrong. The
     # handler validates the active mode and file extension before processing.
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_media_image))
@@ -3497,7 +3018,7 @@ def main():
         default_commands = [
             BotCommand("start", "Open main menu"), BotCommand("help", "Help"), BotCommand("profile", "My Profile"),
             BotCommand("mystats", "My Statistics"), BotCommand("history", "My History"), BotCommand("settings", "Settings"),
-            BotCommand("support", "Contact Admin"), BotCommand("morebots", "More Bots"), BotCommand("imagetools", "Image Tools"), BotCommand("audioextract", "Video to Audio")
+            BotCommand("support", "Contact Admin"), BotCommand("morebots", "More Bots"), BotCommand("imagetools", "Image Tools")
         ]
         await application.bot.set_my_commands(default_commands)
         admin_commands = default_commands + [BotCommand("admin", "Admin Panel"), BotCommand("status", "Admin system status"), BotCommand("addbot", "Add More Bot"), BotCommand("bots", "Manage More Bots")]

@@ -1,140 +1,127 @@
-# 🤖 Assistant Telegram Utility Bot — V39
+# 🤖 Assistant Bot — V41
 
-A multi-purpose Telegram utility bot with downloader, QR tools, Image Tools, More Bots, user profile/statistics, support, admin controls, broadcasts, scheduled broadcasts, monitoring and Render recovery support.
+A Telegram all-in-one utility bot with downloader, QR tools, Image Tools, Video → Audio extraction, user account features, admin controls, support, broadcasts, scheduled tasks, monitoring, and recovery helpers.
 
-## ✨ V39 — Conflict-Safe Deployment Update
+## ✨ V41 — What's New
 
-### 🛠️ Fixed: Telegram `Conflict` error during deployment
+### 🖼️ Image Tools fixes
+- After an Image Tool operation finishes, the selected operation stays active.
+- Users can send another image immediately without reopening Image Tools.
+- Resize target is preserved for repeated batch resizing.
+- Temporary progress messages are deleted after a successful result instead of remaining in the chat.
+- Unrelated video/document messages are no longer incorrectly routed through QR/Image Tools.
+- QR mode is not triggered by Image Tools media accidentally.
 
-You may see this Telegram error when Render is replacing an old bot process with a new one:
+### 🎵 Video → Audio improvements
+- Added real FFmpeg extraction progress updates while the audio is being processed.
+- Progress now moves through download → read → extraction → finalization instead of staying at a single extraction percentage.
+- Uses `ffprobe` to estimate video duration and calculate extraction progress when available.
+- Explicitly selects the first audio stream and gives a clear error when no readable audio track exists.
+- Temporary processing files are cleaned up safely after success or failure.
 
-```text
-Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
-```
+### 🎵 Video → Audio
+- New Home menu: **🎵 Video To Audio**
+- Command: `/audioextract`
+- Send a video and the bot extracts its audio as **MP3** using FFmpeg.
+- Supports common video containers such as MP4, MKV, MOV, WebM, AVI, M4V, 3GP, FLV, TS and MTS.
+- The extracted MP3 is returned as Telegram audio with a clean `.mp3` filename.
+- Users can send another video immediately after extraction.
+- If a video has no readable audio stream, the bot reports the error instead of failing silently.
 
-Telegram permits only one active `getUpdates` polling consumer for a bot token. During a restart/deploy, the old and new Render processes can briefly overlap.
+## 🧪 V41 stability audit
+- Re-checked Python syntax with `python -m py_compile`.
+- Re-checked Image Tools routing so image/video documents are handled only by the active tool mode.
+- Image Tools keep the selected operation active after a successful result and remove temporary progress UI.
+- Video → Audio keeps its mode active for consecutive videos.
+- Polling, error handling, and recovery code remain compatible with the current `python-telegram-bot` application lifecycle.
 
-V39 changes:
-- `Conflict` is treated as a transient polling condition instead of a normal user-facing bot error.
-- Admins are no longer spammed with `🚨 BOT ERROR` for this specific condition.
-- The conflict is still recorded in the bot error log for diagnostics.
-- If the polling layer exits with `Conflict`, the bot waits before retrying instead of immediately forcing another process restart.
-- Other genuine errors continue to use the existing admin error-monitoring system.
+## 🧰 Features
 
-> **Important:** This code reduces false alarms and restart loops. If two separate services are permanently running the same bot token, only one should be kept active. Never run the same polling bot on two independent always-on services.
+- 📥 TikTok Downloader
+- 📷 QR Code Scanner
+- 🔲 QR Code Generator
+- 🖼️ Image Tools
+  - Compress
+  - Resize
+  - JPG
+  - PNG
+  - WebP
+  - Crop Square
+- 🎵 Video → Audio (MP3)
+- 🤖 More Bots
+- 👤 Profile / Statistics / History
+- 🆘 User → Admin Support
+- 📢 Broadcast
+- 📅 Scheduled Broadcast
+- 👑 Admin Panel
+- 🛡️ User management
+- 📊 Dashboard / reports
+- 🔧 Maintenance controls
+- ❤️ Health / recovery monitoring
 
-## 🖼️ Image Tools
+## 🎵 Video → Audio Usage
 
-Available operations:
-- Compress
-- Resize
-- JPG
-- PNG
-- WebP
-- Crop Square
+1. Open **🎵 Video To Audio** from Home, or use `/audioextract`.
+2. Send a video.
+3. Wait for the extraction progress.
+4. The bot returns the extracted audio as an MP3.
+5. Send another video immediately if needed.
 
-Image Tools also includes progress/status messaging and background processing so Pillow work does not block the Telegram event loop.
+### FFmpeg
+The Docker image installs FFmpeg automatically, so no manual FFmpeg installation is required when deploying with the included `Dockerfile`.
 
-### V38 fixes retained in V39
-- Image Tools no longer incorrectly routes images to QR Scanner when Image Tools is active.
-- JPG → PNG, PNG → JPG and other conversions use the correct output extension.
-- Image documents with unusual/missing MIME types are handled more safely.
-- Resize target input is validated before processing.
+## 🖼️ Image Tools Usage
 
-## 🤖 More Bots
+1. Open **🖼️ Image Tools**.
+2. Select an operation.
+3. Send an image.
+4. After the result arrives, the same operation remains active for the next image.
+5. Use the Image Tools menu or Home button to switch/exit.
 
-Admins can add managed bots with:
+For Resize:
+- First send a size such as `1280x720`.
+- The target size remains active so multiple images can be resized consecutively.
 
-```text
-/addbot @BotUsername | Bot Name | Description
-```
+## 👤 User Commands
 
-Manage bots with:
+- `/start` — Home
+- `/help` — Help
+- `/profile` — Profile
+- `/mystats` — Statistics
+- `/history` — History
+- `/morebots` — More Bots
+- `/imagetools` — Image Tools
+- `/audioextract` — Video → Audio
+- `/support` — Contact Admin
+- `/myid` — Show Telegram user ID
 
-```text
-/bots
-```
+## 👑 Admin Commands
 
-Users can view the configured bots and open them from the More Bots interface.
+- `/admin` — Admin Panel
+- `/status` — System status
+- `/stats` — Statistics
+- `/users` — User management
+- `/searchuser` — Search users
+- `/user` — User details
+- `/block` / `/unblock` — User control
+- `/broadcast` — Text broadcast
+- `/broadcast_media` — Media broadcast
+- `/broadcast_button` — Button broadcast
+- `/schedule` — Scheduled broadcast
+- `/scheduled` — Scheduled list
+- `/cancelschedule` — Cancel schedule
+- `/reports` — Broadcast reports
+- `/settings` — Admin settings
+- `/addbot` — Add a More Bot
+- `/bots` — Manage More Bots
+- `/maintenance` — Maintenance mode
+- `/restart` — Restart/recovery helper
 
-## 👑 Admin Features
-
-- Admin Panel
-- Statistics and user management
-- User search/details
-- Block / unblock
-- Broadcast
-- Broadcast reports
-- Scheduled broadcast
-- Support/reply system
-- Maintenance mode
-- Downloader/QR feature controls
-- System status
-- More Bots management
-- Error monitoring
-- Runtime health/recovery
-- Restart controls
-
-## 👤 User Features
-
-- TikTok Downloader
-- QR Scanner
-- QR Generator
-- Image Tools
-- More Bots
-- Profile
-- Statistics
-- History/activity
-- Settings
-- Support
-
-## 📋 Main Commands
-
-### User
-```text
-/start
-/help
-/profile
-/mystats
-/history
-/settings
-/support
-/morebots
-/imagetools
-```
-
-### Admin
-```text
-/admin
-/status
-/stats
-/users
-/user <id>
-/searchuser <id or query>
-/block <id>
-/unblock <id>
-/broadcast
-/reports
-/schedule
-/scheduled
-/cancelschedule <id>
-/reply <user_id> <message>
-/maintenance on|off
-/announce <message>
-/addbot @BotUsername | Bot Name | Description
-/bots
-/restart
-```
-
-## 🚀 Render Deployment
-
-1. Push the project to GitHub.
-2. Deploy it as a Render Web Service.
-3. Add environment variables:
+## ⚙️ Environment Variables
 
 ```text
 BOT_TOKEN=your_telegram_bot_token
-ADMIN_IDS=123456789
+ADMIN_IDS=123456789,987654321
 ```
 
 Optional:
@@ -143,81 +130,92 @@ Optional:
 BOT_DB_PATH=bot_data.db
 ```
 
-4. Use the repository's Dockerfile or configured Python start command.
-5. After deployment, send `/start` to the bot.
-6. Test Image Tools, QR tools, More Bots and admin commands.
+## 🚀 Render Deployment
 
-### ⚠️ One-instance rule
+1. Push the project to GitHub.
+2. Create/connect the Render service.
+3. Set `BOT_TOKEN` in Render Environment Variables.
+4. Set `ADMIN_IDS` with comma-separated Telegram numeric IDs.
+5. Deploy.
+6. Confirm `/start`, Image Tools and `/audioextract` work.
 
-Do not run the same bot token with polling in two separate services at the same time. If another VPS, local machine, Render service, or duplicate deployment is still running the same bot, Telegram can terminate one polling connection with a `Conflict` error.
+The included Dockerfile installs FFmpeg and the required system packages.
 
-## 🧪 V39 Test Checklist
+## 🧪 V41 Test Checklist
 
-After deployment:
+### Image Tools
+- [ ] Compress image
+- [ ] Resize image
+- [ ] Send a second image without reopening Image Tools
+- [ ] JPG → PNG produces a `.png` file
+- [ ] PNG → JPG produces a `.jpg` file
+- [ ] WebP conversion produces `.webp`
+- [ ] Progress message disappears after successful processing
+- [ ] Image Tools does not ask to select QR Scanner
+- [ ] QR Scanner still works when explicitly selected
 
-- [ ] `/start` opens the Home menu
-- [ ] Admin Panel is visible only to admins
-- [ ] Image Tools → PNG conversion produces `.png`
-- [ ] Image Tools does not incorrectly ask for QR Scanner
-- [ ] QR Scanner still works normally
-- [ ] QR Generator still works normally
-- [ ] More Bots works
-- [ ] Support messages reach admin
-- [ ] `/status` remains admin-only
-- [ ] Deploy/restart does not send a false `BOT ERROR` Conflict alert
-- [ ] Genuine application errors still notify admins
+### Video → Audio
+- [ ] Open from Home
+- [ ] `/audioextract` works
+- [ ] MP4 with audio → MP3
+- [ ] Send a second video immediately after the first
+- [ ] Video without audio shows a useful error
+- [ ] Unsupported document does not trigger audio extraction
+
+### Admin / Core
+- [ ] `/admin`
+- [ ] `/status`
+- [ ] Broadcast
+- [ ] Scheduled broadcast
+- [ ] More Bots
+- [ ] Support
+- [ ] Health endpoint / recovery
 
 ## 📝 Version History
 
+### V41
+- Added live FFmpeg/FFprobe extraction progress for Video → Audio.
+- Added safer first-audio-stream mapping and temporary-file cleanup.
+- Re-audited Image Tools routing, repeated processing, polling/error handling, and syntax.
+- Synchronized README with the V41 code.
+
+### V40
+- Fixed Image Tools session reset after successful processing.
+- Removed completed Image Tools progress messages.
+- Improved repeated-image workflow.
+- Added Video → Audio MP3 extractor using FFmpeg.
+- Added `/audioextract`.
+- Added Home menu button for Video → Audio.
+- Updated command menu and documentation.
+
 ### V39
-- Fixed/suppressed false admin alerts for Telegram polling `Conflict` during deployment/restart overlap.
-- Added safer retry behavior for polling Conflict.
-- Preserved V38 Image Tools routing and output-extension fixes.
-- Updated README with deployment troubleshooting and test checklist.
+- Reduced noisy polling Conflict notifications.
+- Improved Render restart/retry behavior.
+- Preserved previous Image Tools and filename fixes.
 
 ### V38
-- Fixed Image Tools → QR Scanner routing issue.
-- Fixed output filename extensions for image conversion.
-- Improved Image Tools document handling.
+- Fixed Image Tools routing issues.
+- Fixed converted image filename extensions.
 - Updated README.
 
 ### V37
 - Added Image Tools processing stages.
-- Moved Pillow CPU-bound work to a background thread.
-- Fixed resize flow.
-- Improved transparency handling.
-- Improved image validation and error handling.
+- Moved Pillow processing off the Telegram event loop.
+- Improved image format handling.
+- Fixed Resize input flow.
 
 ### V35
-- Added runtime heartbeat.
-- Added watchdog/recovery logic.
-- Added health endpoints for Render.
+- Added runtime heartbeat, watchdog, health endpoints and recovery helpers.
 
-### Earlier Versions
-- Admin panel and statistics
-- Broadcast and scheduled broadcast
-- Support system
-- More Bots
-- QR Scanner / Generator
-- TikTok Downloader
-- User profiles/history/settings
+### V31–V34
+- Added and refined More Bots.
+- Redesigned Home UI.
+- Restored Admin UI controls.
 
-## 📁 Project Structure
+## ⚠️ Notes
 
-```text
-bot.py
-qr_scanner.py
-qr_generator.py
-tiktok_downloader.py
-requirements.txt
-Dockerfile
-README.md
-```
-
-## ⚠️ Important Notes
-
-- Keep `BOT_TOKEN` private.
-- Keep `ADMIN_IDS` restricted to trusted Telegram user IDs.
-- Use only one active polling instance per bot token.
-- Render restarts/deploys can briefly overlap processes; V39 handles the resulting transient Conflict more quietly.
-- Runtime recovery helps with unexpected process/event-loop failures but cannot make a free Render service permanently awake.
+- FFmpeg is required for Video → Audio and is installed by the included Dockerfile.
+- Large videos can take longer to download and process.
+- Telegram file-size and Bot API limits still apply.
+- Only one polling instance should use the same bot token at a time.
+- Render Free service sleep/restart behavior is separate from application-level recovery logic.

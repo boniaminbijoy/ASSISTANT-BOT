@@ -7,6 +7,7 @@ import sqlite3
 import traceback
 import sys
 import time
+import shutil
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
@@ -19,8 +20,6 @@ from telegram import (
     Update,
     ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 )
-
-from telegram.error import Conflict
 
 from telegram.ext import (
     Application,
@@ -1025,18 +1024,6 @@ async def reply_user_command(update, context):
 async def error_monitor(update, context):
     err=context.error
     uid=getattr(getattr(update,'effective_user',None),'id',None) if update else None
-
-    # Telegram allows only one active getUpdates consumer for a bot token.
-    # During Render deploy/restart there can be a short overlap between the
-    # old and new process, which produces Conflict. This is a transient
-    # polling condition, not a user/action error, so do not spam admins with
-    # a scary BOT ERROR message for it. Keep it in the local error log for
-    # diagnostics instead.
-    if isinstance(err, Conflict) or type(err).__name__ == 'Conflict':
-        save_error(0, 'polling_conflict', str(err))
-        print(f'ℹ️ Telegram polling conflict (usually deploy/restart overlap): {err}')
-        return
-
     save_error(uid, type(err).__name__, traceback.format_exc())
     with db_connect() as conn:
         admins=[r[0] for r in conn.execute('SELECT user_id FROM admins').fetchall()]
@@ -1469,7 +1456,15 @@ async def process_image(update, context):
                 parse_mode="HTML"
             )
 
-        await progress(100, "✅ <b>Completed!</b>")
+        # Remove temporary progress UI after the result is delivered.
+        # Keep the selected operation active so another image can be sent immediately.
+        try:
+            await msg.delete()
+        except Exception:
+            try:
+                await progress(100, "✅ <b>Completed!</b>")
+            except Exception:
+                pass
         log_activity(user_id, "image_tool", mode)
     except Exception as exc:
         print("Image Tool Error:", repr(exc))
@@ -1482,8 +1477,9 @@ async def process_image(update, context):
         except Exception:
             pass
     finally:
-        context.user_data["image_mode"] = None
-        context.user_data["image_resize_target"] = None
+        # Do not clear image_mode after a successful operation. The user can
+        # send another image immediately without reopening Image Tools.
+        # Resize target is intentionally preserved too, enabling batch resize.
         context.user_data["image_waiting_size"] = False
         try:
             for name in os.listdir(temp_dir):
@@ -1491,6 +1487,197 @@ async def process_image(update, context):
                 if os.path.isfile(path):
                     os.remove(path)
             os.rmdir(temp_dir)
+        except OSError:
+            pass
+
+# ==================================================
+# VIDEO → AUDIO EXTRACTOR
+# ==================================================
+
+VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".3gp", ".flv", ".ts", ".mts")
+
+
+def audio_extract_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎵 Extract Audio", callback_data="audio_extract")],
+        [InlineKeyboardButton("🏠 Home", callback_data="ui_home")],
+    ])
+
+
+async def audio_extract_command(update, context):
+    reset_modes(context)
+    context.user_data["audio_extract_mode"] = True
+    await update.effective_message.reply_text(
+        "🎵 <b>VIDEO → AUDIO</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🎬 Send me a video file and I will extract its audio as MP3.\n"
+        "🎧 The original video will not be changed.\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "Supported: MP4 • MKV • MOV • WebM • AVI • M4V and more",
+        parse_mode="HTML", reply_markup=audio_extract_keyboard()
+    )
+
+
+async def process_audio_extract(update, context):
+    """Extract the first audio stream from a video with live FFmpeg progress."""
+    if not context.user_data.get("audio_extract_mode"):
+        await audio_extract_command(update, context)
+        return
+
+    user_id = update.effective_user.id
+    temp_dir = tempfile.mkdtemp(prefix=f"audio_{user_id}_")
+    src = os.path.join(temp_dir, f"source_{uuid.uuid4().hex}")
+    out = os.path.join(temp_dir, f"audio_{uuid.uuid4().hex}.mp3")
+    msg = await update.effective_message.reply_text(
+        "🎵 <b>VIDEO → AUDIO</b>\n\n<code>░░░░░░░░░░</code> <b>0%</b>\n\n⏳ Starting...",
+        parse_mode="HTML"
+    )
+
+    last_percent = -1
+    last_update = 0.0
+
+    async def progress(percent, stage, force=False):
+        nonlocal last_percent, last_update
+        percent = max(0, min(100, int(percent)))
+        now = time.monotonic()
+        if not force and percent != 100 and percent - last_percent < 2 and now - last_update < 1.2:
+            return
+        last_percent = percent
+        last_update = now
+        try:
+            await msg.edit_text(
+                f"🎵 <b>VIDEO → AUDIO</b>\n\n<code>{make_progress_bar(percent)}</code> <b>{percent}%</b>\n\n{stage}",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+    async def probe_duration(path):
+        """Return media duration in seconds, or 0 if it cannot be probed."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode == 0:
+                return max(0.0, float(stdout.decode("utf-8", "ignore").strip() or 0))
+        except Exception:
+            pass
+        return 0.0
+
+    async def read_ffmpeg_progress(proc, duration):
+        """Read FFmpeg -progress output and update Telegram without blocking."""
+        current_seconds = 0.0
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", "ignore").strip()
+            if text.startswith("out_time_ms="):
+                try:
+                    current_seconds = max(0.0, int(text.split("=", 1)[1]) / 1_000_000)
+                except ValueError:
+                    continue
+                if duration > 0:
+                    # Reserve the first/last portions for download/finalization.
+                    pct = 45 + int(min(1.0, current_seconds / duration) * 33)
+                    await progress(pct, "🎧 Extracting audio...")
+                else:
+                    await progress(45, "🎧 Extracting audio...")
+            elif text == "progress=end":
+                break
+        return current_seconds
+
+    try:
+        if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+            raise RuntimeError("FFmpeg/FFprobe is not installed on the server.")
+
+        message = update.effective_message
+        media = message.video or message.document
+        if not media:
+            await progress(0, "❌ Please send a video file.", force=True)
+            return
+
+        filename = (getattr(media, "file_name", None) or "video.mp4")
+        filename_lower = filename.lower()
+        mime = (getattr(media, "mime_type", None) or "").lower()
+        if not (message.video or mime.startswith("video/") or filename_lower.endswith(VIDEO_EXTENSIONS)):
+            await progress(0, "❌ Please send a supported video file.", force=True)
+            return
+
+        await progress(10, "📥 Downloading video...", force=True)
+        tg_file = await context.bot.get_file(media.file_id)
+        await tg_file.download_to_drive(src)
+        await progress(30, "🔍 Reading video stream...", force=True)
+
+        duration = await probe_duration(src)
+        await progress(45, "🎧 Extracting audio...", force=True)
+
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", src,
+            "-map", "0:a:0?",
+            "-vn", "-map_metadata", "-1",
+            "-codec:a", "libmp3lame", "-q:a", "2",
+            "-progress", "pipe:1", "-nostats",
+            out,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        # FFmpeg progress is read while FFmpeg is running, so the Telegram
+        # message shows real extraction progress instead of staying at 45%.
+        stderr_task = asyncio.create_task(proc.stderr.read())
+        await read_ffmpeg_progress(proc, duration)
+        stderr = await stderr_task
+        returncode = await proc.wait()
+
+        if returncode != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
+            detail = stderr.decode("utf-8", "ignore").strip()[-900:]
+            raise RuntimeError(detail or "The video does not contain a readable audio track.")
+
+        await progress(80, "✨ Finalizing MP3...", force=True)
+        size = os.path.getsize(out)
+        await progress(95, "📤 Preparing audio...", force=True)
+
+        stem = os.path.splitext(os.path.basename(filename))[0] or "extracted_audio"
+        output_filename = f"{stem}.mp3"
+        with open(out, "rb") as fh:
+            input_file = InputFile(fh, filename=output_filename, read_file_handle=True)
+            await update.effective_message.reply_audio(
+                audio=input_file,
+                filename=output_filename,
+                title=stem[:64],
+                caption=f"🎵 <b>Audio extracted successfully</b>\n💾 {size/1024/1024:.2f} MB",
+                parse_mode="HTML"
+            )
+
+        # Remove temporary progress UI after the result is delivered.
+        try:
+            await msg.delete()
+        except Exception:
+            await progress(100, "✅ <b>Completed!</b>", force=True)
+        log_activity(user_id, "video_to_audio")
+    except Exception as exc:
+        print("Audio Extract Error:", repr(exc))
+        try:
+            await msg.edit_text(
+                "❌ <b>Audio extraction failed.</b>\n\n"
+                f"<code>{html.escape(str(exc)[:1200])}</code>\n\n"
+                "Please send another video and try again.", parse_mode="HTML"
+            )
+        except Exception:
+            pass
+    finally:
+        # Keep the tool active so another video can be sent immediately.
+        context.user_data["audio_extract_mode"] = True
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
         except OSError:
             pass
 
@@ -1506,6 +1693,7 @@ def get_main_keyboard(language="en", is_admin_user=False):
         "scanner": "📷 𝗤𝗥 𝗦𝗰𝗮𝗻𝗻𝗲𝗿",
         "generator": "🔲 𝗤𝗥 𝗚𝗲𝗻𝗲𝗿𝗮𝘁𝗼𝗿",
         "image": "🖼️ 𝗜𝗺𝗮𝗴𝗲 𝗧𝗼𝗼𝗹𝘀",
+        "audio": "🎵 𝗩𝗶𝗱𝗲𝗼 𝗧𝗼 𝗔𝘂𝗱𝗶𝗼",
         "stats": "📊 𝗠𝘆 𝗦𝘁𝗮𝘁𝘀",
         "profile": "👤 𝗠𝘆 𝗣𝗿𝗼𝗳𝗶𝗹𝗲",
         "more": "🤖 𝗠𝗼𝗿𝗲 𝗕𝗼𝘁𝘀",
@@ -1521,9 +1709,10 @@ def get_main_keyboard(language="en", is_admin_user=False):
     keyboard = [
         [btn(labels["downloader"], "primary"), btn(labels["scanner"], "primary")],
         [btn(labels["generator"], "primary"), btn(labels["image"], "success")],
-        [btn(labels["more"], "success"), btn(labels["profile"])],
-        [btn(labels["stats"]), btn(labels["history"])],
-        [btn(labels["settings"]), btn(labels["help"])],
+        [btn(labels["audio"], "success"), btn(labels["more"], "success")],
+        [btn(labels["profile"]), btn(labels["stats"])],
+        [btn(labels["history"]), btn(labels["settings"])],
+        [btn(labels["help"])],
     ]
     if is_admin_user:
         keyboard.append([btn(labels["admin"], "primary")])
@@ -1704,6 +1893,8 @@ async def ui_text_action(update, context, text):
         await qr_generator_start(update, context); return True
     if text == "🖼️ 𝗜𝗺𝗮𝗴𝗲 𝗧𝗼𝗼𝗹𝘀":
         await image_tools_command(update, context); return True
+    if text == "🎵 𝗩𝗶𝗱𝗲𝗼 𝗧𝗼 𝗔𝘂𝗱𝗶𝗼":
+        await audio_extract_command(update, context); return True
     if text == "📊 𝗠𝘆 𝗦𝘁𝗮𝘁𝘀":
         messages, scans, generated, downloads = get_user_stats(user.id)
         msg = f"📊 *My Statistics*\n\n💬 Messages: *{messages}*\n📷 QR Scans: *{scans}*\n🔲 QR Generated: *{generated}*\n🎵 TikTok Downloads: *{downloads}*"
@@ -1745,6 +1936,8 @@ def reset_modes(context):
     context.user_data["image_mode"] = None
     context.user_data["image_waiting_size"] = False
     context.user_data["image_resize_target"] = None
+
+    context.user_data["audio_extract_mode"] = False
 
 
 # ==================================================
@@ -2790,12 +2983,14 @@ def main():
     app.add_handler(CommandHandler("history", user_features_command))
     app.add_handler(CommandHandler("morebots", more_bots_command))
     app.add_handler(CommandHandler("imagetools", image_tools_command))
+    app.add_handler(CommandHandler("audioextract", audio_extract_command))
     app.add_handler(CommandHandler("addbot", addbot_command))
     app.add_handler(CommandHandler("bots", bots_command))
     app.add_handler(CallbackQueryHandler(ui_callback, pattern=r"^(ui_|lang_|user_profile$|user_stats$|hist_(downloads|scans|generates|activity)$)"))
     app.add_handler(CallbackQueryHandler(admin_help_callback, pattern=r"^admin_help_[123]$"))
     app.add_handler(CallbackQueryHandler(morebot_callback, pattern=r"^morebot_(view|delete)_\d+$|^more_bots$"))
     app.add_handler(CallbackQueryHandler(image_callback, pattern=r"^image_(menu|compress|resize|convert_jpg|convert_png|convert_webp|crop)$"))
+    app.add_handler(CallbackQueryHandler(lambda u, c: audio_extract_command(u, c), pattern=r"^audio_extract$"))
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^(admin_|set_)"))
 
     # ==========================================
@@ -2825,29 +3020,48 @@ def main():
     # ==========================================
 
     async def handle_media_image(update, context):
+        message = update.effective_message
         image_mode = context.user_data.get("image_mode")
-        if image_mode in {"compress", "resize", "jpg", "png", "webp", "crop"}:
-            if context.user_data.get("image_mode") == "resize" and not context.user_data.get("image_resize_target"):
-                await update.effective_message.reply_text("📐 Please send the target size first, e.g. <code>1280x720</code>.", parse_mode="HTML")
-                context.user_data["image_waiting_size"] = True
+        audio_mode = context.user_data.get("audio_extract_mode", False)
+
+        if audio_mode and (message.video or message.document):
+            media = message.video or message.document
+            filename = (getattr(media, "file_name", None) or "").lower()
+            mime = (getattr(media, "mime_type", None) or "").lower()
+            if message.video or mime.startswith("video/") or filename.endswith(VIDEO_EXTENSIONS):
+                await process_audio_extract(update, context)
                 return
-            await process_image(update, context)
-        elif image_mode == "menu":
-            await update.effective_message.reply_text(
+
+        if image_mode in {"compress", "resize", "jpg", "png", "webp", "crop"}:
+            if message.photo or (message.document and ((message.document.mime_type or "").startswith("image/") or (message.document.file_name or "").lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff")))):
+                if image_mode == "resize" and not context.user_data.get("image_resize_target"):
+                    await message.reply_text("📐 Please send the target size first, e.g. <code>1280x720</code>.", parse_mode="HTML")
+                    context.user_data["image_waiting_size"] = True
+                    return
+                await process_image(update, context)
+                return
+
+        if image_mode == "menu" and (message.photo or message.document):
+            await message.reply_text(
                 "🖼️ <b>IMAGE TOOLS</b>\n\nPlease choose an Image Tools operation first, then send your image.",
-                parse_mode="HTML",
-                reply_markup=image_tools_keyboard()
+                parse_mode="HTML", reply_markup=image_tools_keyboard()
             )
-        elif context.user_data.get("qr_mode", False):
-            await handle_qr_image(update, context)
-        else:
-            # No active image/QR mode: don't route an arbitrary document to
-            # the QR scanner. This avoids the misleading QR prompt.
             return
 
-    # Document.IMAGE checks MIME type only. Telegram can occasionally send an
-    # image document with a missing/wrong MIME type, so accept all documents
-    # here and let Pillow + filename validation decide whether it is an image.
+        if context.user_data.get("qr_mode", False) and (message.photo or message.document):
+            await handle_qr_image(update, context)
+            return
+
+        # No active mode: ignore unrelated documents instead of sending a QR prompt.
+        return
+
+    async def handle_video_media(update, context):
+        if context.user_data.get("audio_extract_mode"):
+            await process_audio_extract(update, context)
+
+    app.add_handler(MessageHandler(filters.VIDEO, handle_video_media))
+    # Documents are broad by design: MIME types can be missing/wrong. The
+    # handler validates the active mode and file extension before processing.
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_media_image))
 
     # ==========================================
@@ -2872,7 +3086,7 @@ def main():
         default_commands = [
             BotCommand("start", "Open main menu"), BotCommand("help", "Help"), BotCommand("profile", "My Profile"),
             BotCommand("mystats", "My Statistics"), BotCommand("history", "My History"), BotCommand("settings", "Settings"),
-            BotCommand("support", "Contact Admin"), BotCommand("morebots", "More Bots"), BotCommand("imagetools", "Image Tools")
+            BotCommand("support", "Contact Admin"), BotCommand("morebots", "More Bots"), BotCommand("imagetools", "Image Tools"), BotCommand("audioextract", "Video to Audio")
         ]
         await application.bot.set_my_commands(default_commands)
         admin_commands = default_commands + [BotCommand("admin", "Admin Panel"), BotCommand("status", "Admin system status"), BotCommand("addbot", "Add More Bot"), BotCommand("bots", "Manage More Bots")]
@@ -2900,16 +3114,6 @@ def main():
     except KeyboardInterrupt:
         raise
     except Exception as exc:
-        # A Conflict can happen briefly while Render is replacing the old
-        # instance with the new one. Do not immediately exec-restart again,
-        # because that can create a restart/conflict loop. Let the service
-        # process settle first.
-        if isinstance(exc, Conflict) or type(exc).__name__ == 'Conflict':
-            save_error(0, "polling_conflict", str(exc))
-            print(f"ℹ️ Polling conflict during deploy/restart; waiting before retry: {exc!r}")
-            time.sleep(15)
-            return main()
-
         save_error(0, "polling_crash", traceback.format_exc())
         print(f"🚨 Polling stopped unexpectedly: {exc!r}")
         # Replace the process so Render sees a fresh bot process.

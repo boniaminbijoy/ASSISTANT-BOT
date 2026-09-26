@@ -1,542 +1,223 @@
-# 🤖 Assistant Bot — V37
+# 🤖 Assistant Telegram Utility Bot — V39
 
-> **All-in-One Telegram Utility Bot** with downloader, QR tools, image tools, user accounts, support, admin controls, broadcasts, More Bots, monitoring, and Render deployment support.
+A multi-purpose Telegram utility bot with downloader, QR tools, Image Tools, More Bots, user profile/statistics, support, admin controls, broadcasts, scheduled broadcasts, monitoring and Render recovery support.
 
-![Version](https://img.shields.io/badge/version-V37-blue)
-![Platform](https://img.shields.io/badge/platform-Telegram-2CA5E0)
-![Python](https://img.shields.io/badge/Python-3.13+-3776AB)
-![Deployment](https://img.shields.io/badge/deployment-Render-46E3B7)
+## ✨ V39 — Conflict-Safe Deployment Update
 
----
+### 🛠️ Fixed: Telegram `Conflict` error during deployment
 
-## ✨ V37 Highlights
+You may see this Telegram error when Render is replacing an old bot process with a new one:
 
-V37 focuses on a more complete utility-bot experience and includes the latest **Image Tools fixes** plus runtime recovery support.
+```text
+Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+```
 
-### 🖼️ Image Tools
+Telegram permits only one active `getUpdates` polling consumer for a bot token. During a restart/deploy, the old and new Render processes can briefly overlap.
 
-Available from **Image Tools** or `/imagetools`:
+V39 changes:
+- `Conflict` is treated as a transient polling condition instead of a normal user-facing bot error.
+- Admins are no longer spammed with `🚨 BOT ERROR` for this specific condition.
+- The conflict is still recorded in the bot error log for diagnostics.
+- If the polling layer exits with `Conflict`, the bot waits before retrying instead of immediately forcing another process restart.
+- Other genuine errors continue to use the existing admin error-monitoring system.
 
-- 🗜️ **Compress Image**
-- 📐 **Resize Image** with exact dimensions such as `1280x720`
-- 🔄 **Convert to JPG**
-- 🟦 **Convert to PNG**
-- 🌐 **Convert to WebP**
-- ✂️ **Crop to Square**
-- ⏳ Processing status/progress messages during image processing
-- 🧵 Pillow processing runs outside the Telegram event loop so the bot can remain responsive
-- 🪄 Better handling of transparent images and PNG/WebP alpha channels
-- 📎 Supports image uploads sent as Telegram photos or supported image documents
+> **Important:** This code reduces false alarms and restart loops. If two separate services are permanently running the same bot token, only one should be kept active. Never run the same polling bot on two independent always-on services.
 
-### 🛠️ Image Tools V37 fixes
+## 🖼️ Image Tools
 
-- Fixed the resize flow so the bot correctly waits for the requested dimensions.
-- Resize uses the exact dimensions entered by the user.
-- Added staged processing updates: starting → downloading → reading → processing → optimizing → preparing → completed.
-- Improved handling of transparent images.
-- Added stronger validation and clearer error messages.
-- Temporary files are cleaned up after processing.
+Available operations:
+- Compress
+- Resize
+- JPG
+- PNG
+- WebP
+- Crop Square
 
----
+Image Tools also includes progress/status messaging and background processing so Pillow work does not block the Telegram event loop.
 
-## 🚀 Main User Features
+### V38 fixes retained in V39
+- Image Tools no longer incorrectly routes images to QR Scanner when Image Tools is active.
+- JPG → PNG, PNG → JPG and other conversions use the correct output extension.
+- Image documents with unusual/missing MIME types are handled more safely.
+- Resize target input is validated before processing.
 
-### 🎵 TikTok Downloader
+## 🤖 More Bots
 
-- Download supported TikTok links.
-- Quality selection where available.
-- Download activity is stored in user history.
-- Downloader can be enabled/disabled by an administrator.
-
-### 📷 QR Scanner
-
-- Send a QR image to scan it.
-- Scan history is stored for the user.
-- QR Scanner can be enabled/disabled by an administrator.
-
-### 🔲 QR Generator
-
-- Generate QR codes from text or links.
-- Generated QR activity is stored in history.
-- QR Generator can be enabled/disabled by an administrator.
-
-### 👤 User Account
-
-Users can access:
-
-- Profile
-- Statistics
-- Download History
-- QR Scan History
-- QR Generate History
-- Activity History
-- Language/settings
-
-### 🤖 More Bots
-
-Admins can add other Telegram bots to the More Bots directory.
-
-Admin format:
+Admins can add managed bots with:
 
 ```text
 /addbot @BotUsername | Bot Name | Description
 ```
 
-Users can:
-
-- View the bots added by admins
-- Open a bot from the directory
-- Return to the More Bots list or Home
-
-Management commands:
+Manage bots with:
 
 ```text
-/morebots
-/addbot @BotUsername | Bot Name | Description
 /bots
 ```
 
-Only administrators can manage the More Bots list.
+Users can view the configured bots and open them from the More Bots interface.
 
-### 🆘 User → Admin Support
+## 👑 Admin Features
 
-Users can contact administrators through `/support`.
-
-Support messages are stored locally with delivery status, and admins can reply to users with:
-
-```text
-/reply <user_id> <message>
-```
-
-The support flow also protects against normal menu/button text accidentally being forwarded as a support message.
-
-### ⚙️ Settings & Languages
-
-- বাংলা / English language selection
-- User preferences are stored locally
-- Home, Help, Settings, Profile, Statistics and History are available through the UI
-
----
-
-# 👑 Admin Panel
-
-Open the admin panel with:
-
-```text
-/admin
-```
-
-The panel includes:
-
-### 📊 Dashboard & User Management
-
-- Dashboard statistics
-- User list
-- User details
-- User search
-- User count
-- Active users
-- New users
-- Top users
+- Admin Panel
+- Statistics and user management
+- User search/details
 - Block / unblock
-- Ban / unban
-- Admin list
-- Add admin / delete admin
-
-### 📢 Broadcast System
-
-#### Text broadcast
-
-```text
-/broadcast <text>
-```
-
-#### Media broadcast
-
-Reply to a photo, video or document and use:
-
-```text
-/broadcast_media
-```
-
-#### URL-button broadcast
-
-```text
-/broadcast_button Button Text | https://example.com
-```
-
-Broadcast reports include target, sent, failed and blocked counts.
-
-### ⏰ Scheduled Broadcast
-
-Create a scheduled broadcast with:
-
-```text
-/schedule <date/time> | <message>
-```
-
-Manage schedules with:
-
-```text
-/scheduled
-/cancelschedule <id>
-```
-
-Scheduled jobs use the bot's job queue.
-
-### 📣 Announcement
-
-```text
-/announce <message>
-```
-
-### 🔧 Maintenance & Feature Controls
-
-Admins can control:
-
+- Broadcast
+- Broadcast reports
+- Scheduled broadcast
+- Support/reply system
 - Maintenance mode
+- Downloader/QR feature controls
+- System status
+- More Bots management
+- Error monitoring
+- Runtime health/recovery
+- Restart controls
+
+## 👤 User Features
+
 - TikTok Downloader
 - QR Scanner
 - QR Generator
+- Image Tools
+- More Bots
+- Profile
+- Statistics
+- History/activity
+- Settings
+- Support
 
-The Admin Panel shows the current ON/OFF state directly on the buttons.
+## 📋 Main Commands
 
-### 🧪 System Status
-
+### User
 ```text
+/start
+/help
+/profile
+/mystats
+/history
+/settings
+/support
+/morebots
+/imagetools
+```
+
+### Admin
+```text
+/admin
 /status
-```
-
-`/status` is intentionally **admin-only**. Normal users do not receive a status response.
-
-The status page provides a live registry of available commands and feature/button states.
-
-### 📈 Reports
-
-```text
+/stats
+/users
+/user <id>
+/searchuser <id or query>
+/block <id>
+/unblock <id>
+/broadcast
 /reports
-```
-
-Shows recent broadcast reports.
-
-### 🔄 Runtime Controls
-
-```text
-/ping
+/schedule
+/scheduled
+/cancelschedule <id>
+/reply <user_id> <message>
+/maintenance on|off
+/announce <message>
+/addbot @BotUsername | Bot Name | Description
+/bots
 /restart
 ```
 
-V37 also contains runtime heartbeat/watchdog logic intended to detect failures and attempt recovery.
+## 🚀 Render Deployment
 
----
-
-# 📋 Command Reference
-
-## 👤 User Commands
-
-| Command | Purpose |
-|---|---|
-| `/start` | Open the main menu |
-| `/help` | User help |
-| `/profile` | View profile |
-| `/mystats` | View personal statistics |
-| `/history` | View history menu |
-| `/settings` | Open settings |
-| `/support` | Contact support/admin |
-| `/about` | About the bot |
-| `/id` | Show Telegram user ID |
-| `/myid` | Show Telegram user ID |
-| `/morebots` | Open More Bots |
-| `/imagetools` | Open Image Tools |
-
-## 👑 Admin Commands
-
-| Command | Purpose |
-|---|---|
-| `/admin` | Open Admin Panel |
-| `/stats` | Admin statistics |
-| `/users` | User list |
-| `/user` | User details |
-| `/searchuser` | Search users |
-| `/usercount` | User count |
-| `/activeusers` | Active-user statistics |
-| `/newuser` | New-user statistics |
-| `/topuser` | Top-user statistics |
-| `/block` | Block a user |
-| `/unblock` | Unblock a user |
-| `/ban` | Ban a user |
-| `/unban` | Unban a user |
-| `/adminlist` | Admin list |
-| `/addadmin` | Add an admin |
-| `/deladmin` | Remove an admin |
-| `/broadcast` | Text broadcast |
-| `/broadcast_media` | Media broadcast |
-| `/broadcast_button` | URL-button broadcast |
-| `/reports` | Broadcast reports |
-| `/announce` | Announcement |
-| `/schedule` | Schedule broadcast |
-| `/scheduled` | List scheduled broadcasts |
-| `/cancelschedule` | Cancel a scheduled broadcast |
-| `/reply` | Reply to a user |
-| `/maintenance` | Maintenance mode |
-| `/status` | Live command/feature status |
-| `/ping` | Bot ping |
-| `/restart` | Restart/recovery command |
-| `/addbot` | Add a bot to More Bots |
-| `/bots` | Manage More Bots |
-| `/helpadmin` | Admin help |
-
----
-
-# 🗃️ Data & Storage
-
-The bot uses a local SQLite database for operational data, including areas such as:
-
-- Users
-- Download history
-- QR scan history
-- QR generation history
-- Broadcast reports
-- Scheduled broadcasts
-- Support messages
-- Error/activity records
-- Admin and feature settings
-- More Bots entries
-
-The exact database schema is created/updated by `bot.py` when the bot starts.
-
----
-
-# 🛡️ Runtime Health & Recovery
-
-V37 includes a lightweight runtime monitoring system:
-
-- Runtime heartbeat
-- Watchdog checks for event-loop problems
-- Polling crash recovery attempts
-- Error logging
-- Health endpoints for Render
-
-Health endpoints:
+1. Push the project to GitHub.
+2. Deploy it as a Render Web Service.
+3. Add environment variables:
 
 ```text
-/health
-/healthz
+BOT_TOKEN=your_telegram_bot_token
+ADMIN_IDS=123456789
 ```
 
-> **Important:** application-level recovery cannot prevent every platform-level sleep/restart. Render plan behavior still applies to the deployed service.
-
----
-
-# 📁 Project Structure
+Optional:
 
 ```text
-assistant-bot/
-├── bot.py
-├── qr_scanner.py
-├── qr_generator.py
-├── tiktok_downloader.py
-├── requirements.txt
-├── Dockerfile
-└── README.md
+BOT_DB_PATH=bot_data.db
 ```
 
-### File roles
+4. Use the repository's Dockerfile or configured Python start command.
+5. After deployment, send `/start` to the bot.
+6. Test Image Tools, QR tools, More Bots and admin commands.
 
-- `bot.py` — main Telegram bot, database, UI, admin system, Image Tools, monitoring and handlers
-- `qr_scanner.py` — QR decoding support
-- `qr_generator.py` — QR generation support
-- `tiktok_downloader.py` — TikTok download helper
-- `requirements.txt` — Python dependencies
-- `Dockerfile` — container build configuration
-- `README.md` — project documentation and version notes
+### ⚠️ One-instance rule
 
----
+Do not run the same bot token with polling in two separate services at the same time. If another VPS, local machine, Render service, or duplicate deployment is still running the same bot, Telegram can terminate one polling connection with a `Conflict` error.
 
-# 📦 Requirements
+## 🧪 V39 Test Checklist
 
-The current dependency set includes:
+After deployment:
 
-- Python 3.13+
-- `python-telegram-bot[job-queue]`
-- Pillow
-- OpenCV Headless
-- qrcode
-- pyzbar
-- yt-dlp
-- curl-cffi
-- FFmpeg
-- ZBar (`libzbar0`)
+- [ ] `/start` opens the Home menu
+- [ ] Admin Panel is visible only to admins
+- [ ] Image Tools → PNG conversion produces `.png`
+- [ ] Image Tools does not incorrectly ask for QR Scanner
+- [ ] QR Scanner still works normally
+- [ ] QR Generator still works normally
+- [ ] More Bots works
+- [ ] Support messages reach admin
+- [ ] `/status` remains admin-only
+- [ ] Deploy/restart does not send a false `BOT ERROR` Conflict alert
+- [ ] Genuine application errors still notify admins
 
-The included Dockerfile installs the required system packages for the bot container.
+## 📝 Version History
 
----
+### V39
+- Fixed/suppressed false admin alerts for Telegram polling `Conflict` during deployment/restart overlap.
+- Added safer retry behavior for polling Conflict.
+- Preserved V38 Image Tools routing and output-extension fixes.
+- Updated README with deployment troubleshooting and test checklist.
 
-# 🔐 Environment Configuration
+### V38
+- Fixed Image Tools → QR Scanner routing issue.
+- Fixed output filename extensions for image conversion.
+- Improved Image Tools document handling.
+- Updated README.
 
-The bot expects its Telegram token and admin configuration through environment variables used by the code.
+### V37
+- Added Image Tools processing stages.
+- Moved Pillow CPU-bound work to a background thread.
+- Fixed resize flow.
+- Improved transparency handling.
+- Improved image validation and error handling.
 
-Typical deployment values include:
+### V35
+- Added runtime heartbeat.
+- Added watchdog/recovery logic.
+- Added health endpoints for Render.
 
-```text
-BOT_TOKEN=<your-telegram-bot-token>
-ADMIN_IDS=<comma-separated-admin-user-ids>
-```
-
-> Keep tokens and private credentials in Render Environment Variables or another secret store. Do **not** commit real bot tokens to GitHub.
-
----
-
-# 🚀 Render Deployment
-
-This project includes a Dockerfile and can be deployed as a Render service.
-
-### Basic deployment flow
-
-1. Push the project files to GitHub.
-2. Create/select the Render service.
-3. Connect the GitHub repository.
-4. Use the included `Dockerfile`.
-5. Add the required environment variables.
-6. Deploy.
-7. Check the service logs.
-8. Open the Telegram bot and run `/start`.
-
-After an update:
-
-1. Replace the project files with the new version.
-2. Commit and push to GitHub.
-3. Let Render deploy the new commit, or trigger a manual deploy.
-4. Check logs for startup errors.
-5. Test `/start`, the Admin Panel and the newly changed feature.
-
----
-
-# 🧪 Recommended Post-Update Test
-
-After every bot update, test these core areas:
-
-- `/start`
-- Home menu buttons
-- `/help`
+### Earlier Versions
+- Admin panel and statistics
+- Broadcast and scheduled broadcast
+- Support system
+- More Bots
+- QR Scanner / Generator
 - TikTok Downloader
-- QR Scanner
-- QR Generator
-- `/profile`
-- `/mystats`
-- `/history`
-- `/support`
-- `/morebots`
-- `/imagetools`
-- Admin Panel
-- `/status` as admin and non-admin
-- Broadcast system if used
-- Render logs / health endpoints
+- User profiles/history/settings
 
-For Image Tools, test at least:
+## 📁 Project Structure
 
-1. Compress
-2. Resize with `1280x720`
-3. JPG conversion
-4. PNG conversion
-5. WebP conversion
-6. Crop Square
-7. A transparent PNG if available
+```text
+bot.py
+qr_scanner.py
+qr_generator.py
+tiktok_downloader.py
+requirements.txt
+Dockerfile
+README.md
+```
 
----
+## ⚠️ Important Notes
 
-# 📝 Version History
-
-## V37 — Image Tools Fixes + Processing Updates
-
-### Added / improved
-
-- Image Tools menu
-- Compress
-- Exact-dimension Resize
-- JPG / PNG / WebP conversion
-- Square Crop
-- Processing progress stages
-- Background-thread image processing using `asyncio.to_thread()`
-- Better transparency handling
-- Better image validation
-- Runtime heartbeat/watchdog and health endpoints retained
-
-### Fixed
-
-- Resize mode not correctly entering the size-input flow
-- Image processing blocking the Telegram event loop
-- Several transparency/output-format edge cases
-- Image-processing error handling and cleanup
-
-## V36 — Image Tools
-
-- Initial Image Tools implementation
-- Image compression
-- Resize
-- Format conversion
-- Crop Square
-- Image Tools UI
-
-## V35 — Auto Recovery / Health Monitor
-
-- Runtime heartbeat
-- Watchdog/recovery logic
-- Polling crash recovery attempt
-- `/health` and `/healthz`
-- Render health support
-
-## V34 — Home UI + Admin Button Fix
-
-- Redesigned Home UI
-- Styled section headings
-- Admin button visibility fixed
-- `/admin` refresh support
-
-## V33 — Redesigned Home UI
-
-- New Home layout
-- More structured utility sections
-- Updated visual style
-
-## V32 — More Bots UI Fixes
-
-- More Bots navigation improvements
-- Back/Home controls
-
-## V31 — More Bots System
-
-- Admin-managed bot directory
-- User-facing More Bots menu
-- Add/remove bot management
-
-## V30 — AI Label Remover Removed
-
-- AI Label Remover feature removed from the bot.
-
-## V29 and earlier
-
-Previous releases introduced and refined the Admin Panel, user statistics/history, broadcasts, support, feature toggles, command menu, QR tools, downloader and other core bot functions.
-
----
-
-# ⚠️ Notes
-
-- Telegram, TikTok and other third-party services can change their behavior independently of this project.
-- Downloader compatibility may require dependency updates when external platforms change.
-- Do not expose your bot token or admin credentials.
-- Keep regular backups of the SQLite database if the bot's stored history/data is important.
-
----
-
-# 📌 Current Version
-
-**Assistant Bot V37**
-
-README last refreshed with the complete V37 feature set and deployment/documentation details.
-
----
-
-## 📄 License
-
-No separate license file is included in this package unless added by the project owner. Add an appropriate `LICENSE` file before distributing the project publicly if licensing terms are required.
+- Keep `BOT_TOKEN` private.
+- Keep `ADMIN_IDS` restricted to trusted Telegram user IDs.
+- Use only one active polling instance per bot token.
+- Render restarts/deploys can briefly overlap processes; V39 handles the resulting transient Conflict more quietly.
+- Runtime recovery helps with unexpected process/event-loop failures but cannot make a free Render service permanently awake.

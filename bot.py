@@ -17,8 +17,10 @@ from threading import Thread, Lock
 
 from telegram import (
     Update,
-    ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+    ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 )
+
+from telegram.error import Conflict
 
 from telegram.ext import (
     Application,
@@ -1023,6 +1025,18 @@ async def reply_user_command(update, context):
 async def error_monitor(update, context):
     err=context.error
     uid=getattr(getattr(update,'effective_user',None),'id',None) if update else None
+
+    # Telegram allows only one active getUpdates consumer for a bot token.
+    # During Render deploy/restart there can be a short overlap between the
+    # old and new process, which produces Conflict. This is a transient
+    # polling condition, not a user/action error, so do not spam admins with
+    # a scary BOT ERROR message for it. Keep it in the local error log for
+    # diagnostics instead.
+    if isinstance(err, Conflict) or type(err).__name__ == 'Conflict':
+        save_error(0, 'polling_conflict', str(err))
+        print(f'ℹ️ Telegram polling conflict (usually deploy/restart overlap): {err}')
+        return
+
     save_error(uid, type(err).__name__, traceback.format_exc())
     with db_connect() as conn:
         admins=[r[0] for r in conn.execute('SELECT user_id FROM admins').fetchall()]
@@ -1275,6 +1289,10 @@ async def image_callback(update, context):
     await query.answer()
     d = query.data
     if d == "image_menu":
+        # Entering Image Tools must always leave QR/TikTok/other modes.
+        # Otherwise a previously active QR scanner session can intercept the
+        # next image and ask the user to select QR CODE SCANNER again.
+        reset_modes(context)
         context.user_data["image_mode"] = "menu"
         await query.edit_message_text(
             "🖼️ <b>IMAGE TOOLS</b>\n\nChoose an operation:",
@@ -1291,6 +1309,9 @@ async def image_callback(update, context):
     }
     if d in operations:
         op = operations[d]
+        # Switching to any Image Tools operation explicitly clears every
+        # other media mode first (especially QR scanner mode).
+        reset_modes(context)
         context.user_data["image_mode"] = op
         if op == "resize":
             context.user_data["image_waiting_size"] = True
@@ -1435,9 +1456,15 @@ async def process_image(update, context):
             f"💾 {before/1024:.1f} KB → {after/1024:.1f} KB"
         )
         with open(out, "rb") as fh:
+            # Force the generated output filename + MIME type. This prevents
+            # Telegram clients from retaining the source extension (e.g.
+            # showing a PNG conversion as .jpg).
+            output_filename = f"image_tools_{mode}.{ext}"
+            mime_types = {"jpg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
+            input_file = InputFile(fh, filename=output_filename, read_file_handle=True)
             await update.effective_message.reply_document(
-                document=fh,
-                filename=os.path.basename(out),
+                document=input_file,
+                filename=output_filename,
                 caption=caption,
                 parse_mode="HTML"
             )
@@ -2798,16 +2825,30 @@ def main():
     # ==========================================
 
     async def handle_media_image(update, context):
-        if context.user_data.get("image_mode") in {"compress", "resize", "jpg", "png", "webp", "crop"}:
+        image_mode = context.user_data.get("image_mode")
+        if image_mode in {"compress", "resize", "jpg", "png", "webp", "crop"}:
             if context.user_data.get("image_mode") == "resize" and not context.user_data.get("image_resize_target"):
                 await update.effective_message.reply_text("📐 Please send the target size first, e.g. <code>1280x720</code>.", parse_mode="HTML")
                 context.user_data["image_waiting_size"] = True
                 return
             await process_image(update, context)
-        else:
+        elif image_mode == "menu":
+            await update.effective_message.reply_text(
+                "🖼️ <b>IMAGE TOOLS</b>\n\nPlease choose an Image Tools operation first, then send your image.",
+                parse_mode="HTML",
+                reply_markup=image_tools_keyboard()
+            )
+        elif context.user_data.get("qr_mode", False):
             await handle_qr_image(update, context)
+        else:
+            # No active image/QR mode: don't route an arbitrary document to
+            # the QR scanner. This avoids the misleading QR prompt.
+            return
 
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_media_image))
+    # Document.IMAGE checks MIME type only. Telegram can occasionally send an
+    # image document with a missing/wrong MIME type, so accept all documents
+    # here and let Pillow + filename validation decide whether it is an image.
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_media_image))
 
     # ==========================================
     # START BOT
@@ -2859,6 +2900,16 @@ def main():
     except KeyboardInterrupt:
         raise
     except Exception as exc:
+        # A Conflict can happen briefly while Render is replacing the old
+        # instance with the new one. Do not immediately exec-restart again,
+        # because that can create a restart/conflict loop. Let the service
+        # process settle first.
+        if isinstance(exc, Conflict) or type(exc).__name__ == 'Conflict':
+            save_error(0, "polling_conflict", str(exc))
+            print(f"ℹ️ Polling conflict during deploy/restart; waiting before retry: {exc!r}")
+            time.sleep(15)
+            return main()
+
         save_error(0, "polling_crash", traceback.format_exc())
         print(f"🚨 Polling stopped unexpectedly: {exc!r}")
         # Replace the process so Render sees a fresh bot process.

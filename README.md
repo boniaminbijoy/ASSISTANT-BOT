@@ -1,8 +1,8 @@
-# 🤖 Assistant Bot — V41
+# 🤖 Assistant Bot — V42
 
 A Telegram all-in-one utility bot with downloader, QR tools, Image Tools, Video → Audio extraction, user account features, admin controls, support, broadcasts, scheduled tasks, monitoring, and recovery helpers.
 
-## ✨ V41 — What's New
+## ✨ V42 — Telegram Official Ads Monetization
 
 ### 🖼️ Image Tools fixes
 - After an Image Tool operation finishes, the selected operation stays active.
@@ -34,6 +34,18 @@ A Telegram all-in-one utility bot with downloader, QR tools, Image Tools, Video 
 - Image Tools keep the selected operation active after a successful result and remove temporary progress UI.
 - Video → Audio keeps its mode active for consecutive videos.
 - Polling, error handling, and recovery code remain compatible with the current `python-telegram-bot` application lifecycle.
+
+
+### 📢 Monetization model
+- Premium/subscription/quota monetization is intentionally **not included**.
+- The bot is designed to remain free for all users.
+- Monetization is through Telegram's official sponsored ads shown in chats with eligible bots.
+- The bot does **not** create fake ads, custom ad-gates, or claim that a user watched an ad before allowing a tool to run.
+- Official sponsored ads are displayed and tracked by Telegram clients; the Bot API does not provide a supported way for this bot to force an ad before a specific tool or verify that a user watched one.
+- Telegram states that bot owners can receive 50% of revenue from ads displayed in their bots, subject to Telegram's eligibility and monetization rules.
+
+### 💡 Important
+There is no bot-side implementation required to make Telegram's official bot ad bar appear. After the bot is eligible for Telegram Ads revenue sharing, Telegram handles the sponsored-message delivery/display in supported clients.
 
 ## 🧰 Features
 
@@ -141,7 +153,7 @@ BOT_DB_PATH=bot_data.db
 
 The included Dockerfile installs FFmpeg and the required system packages.
 
-## 🧪 V41 Test Checklist
+## 🧪 V42 Test Checklist
 
 ### Image Tools
 - [ ] Compress image
@@ -172,6 +184,11 @@ The included Dockerfile installs FFmpeg and the required system packages.
 - [ ] Health endpoint / recovery
 
 ## 📝 Version History
+
+### V42
+- Removed any planned Premium/quota concept from the monetization design.
+- Added Telegram Official Sponsored Ads monetization documentation.
+- Confirmed the bot does not implement fake/custom ad-gates or ad-watch verification.
 
 ### V41
 - Added live FFmpeg/FFprobe extraction progress for Video → Audio.

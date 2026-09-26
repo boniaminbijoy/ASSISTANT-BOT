@@ -5,12 +5,15 @@ import tempfile
 import uuid
 import sqlite3
 import traceback
-import re
+import sys
+import time
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from threading import Thread
+
+from PIL import Image, ImageOps
+from threading import Thread, Lock
 
 from telegram import (
     Update,
@@ -41,6 +44,23 @@ from tiktok_downloader import (
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
+# Runtime health / recovery state. This does NOT prevent Render Free from
+# sleeping; it helps recover from an unexpected polling/event-loop failure
+# while the service is running.
+HEARTBEAT_LOCK = Lock()
+LAST_HEARTBEAT = time.time()
+RECOVERY_RESTARTING = False
+
+def touch_heartbeat():
+    global LAST_HEARTBEAT
+    with HEARTBEAT_LOCK:
+        LAST_HEARTBEAT = time.time()
+
+def heartbeat_age():
+    with HEARTBEAT_LOCK:
+        return time.time() - LAST_HEARTBEAT
+
+
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN is missing. Add BOT_TOKEN in Render Environment Variables.")
 
@@ -48,7 +68,7 @@ if not BOT_TOKEN:
 # PHASE 3 - USER DATABASE / ADMIN CONFIG
 # ==================================================
 DB_PATH = os.environ.get("BOT_DB_PATH", "bot_data.db")
-ADMIN_IDS = {int(x) for x in re.findall(r"\d+", os.environ.get("ADMIN_IDS", ""))}
+ADMIN_IDS = {int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").replace(";", ",").split(",") if x.strip().isdigit()}
 
 
 async def myid_command(update, context):
@@ -291,7 +311,6 @@ def save_broadcast_report(admin_id, kind, target, sent, failed, blocked):
         conn.commit()
 
 def is_admin(user_id):
-    # Accept ADMIN_IDS values separated by commas, spaces, semicolons or newlines.
     if user_id in ADMIN_IDS:
         return True
     try:
@@ -1106,10 +1125,15 @@ async def track_update(update, context):
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
+        if self.path.split("?", 1)[0] not in ("/", "/health", "/healthz"):
+            self.send_response(404)
+            self.end_headers()
+            return
+        age = heartbeat_age()
+        self.send_response(200 if age < 90 else 503)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"ASSISTANT BOT is running!")
+        self.wfile.write(f"ASSISTANT BOT is running | heartbeat_age={age:.1f}s".encode())
 
     def log_message(self, format, *args):
         pass
@@ -1211,6 +1235,168 @@ async def user_features_command(update, context):
     await update.effective_message.reply_text("👤 <b>MY ACCOUNT</b>\n\nChoose what you want to view:", parse_mode="HTML", reply_markup=user_features_keyboard())
 
 # ==================================================
+# IMAGE TOOLS
+# ==================================================
+
+def image_tools_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗜️ Compress", callback_data="image_compress"),
+         InlineKeyboardButton("📐 Resize", callback_data="image_resize")],
+        [InlineKeyboardButton("🔄 JPG", callback_data="image_convert_jpg"),
+         InlineKeyboardButton("🟦 PNG", callback_data="image_convert_png"),
+         InlineKeyboardButton("🌐 WebP", callback_data="image_convert_webp")],
+        [InlineKeyboardButton("✂️ Crop Square", callback_data="image_crop")],
+        [InlineKeyboardButton("🏠 Home", callback_data="ui_home")],
+    ])
+
+def image_mode_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🖼️ Image Tools", callback_data="image_menu")],
+        [InlineKeyboardButton("🏠 Home", callback_data="ui_home")],
+    ])
+
+async def image_tools_command(update, context):
+    reset_modes(context)
+    context.user_data["image_mode"] = "menu"
+    await update.effective_message.reply_text(
+        "🖼️ <b>IMAGE TOOLS</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🗜️ Compress image\n"
+        "📐 Resize image\n"
+        "🔄 Convert JPG / PNG / WebP\n"
+        "✂️ Crop to square\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "👇 Choose an operation:",
+        parse_mode="HTML", reply_markup=image_tools_keyboard()
+    )
+
+async def image_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    d = query.data
+    if d == "image_menu":
+        context.user_data["image_mode"] = "menu"
+        await query.edit_message_text(
+            "🖼️ <b>IMAGE TOOLS</b>\n\nChoose an operation:",
+            parse_mode="HTML", reply_markup=image_tools_keyboard()
+        )
+        return
+    operations = {
+        "image_compress": "compress",
+        "image_resize": "resize",
+        "image_convert_jpg": "jpg",
+        "image_convert_png": "png",
+        "image_convert_webp": "webp",
+        "image_crop": "crop",
+    }
+    if d in operations:
+        op = operations[d]
+        context.user_data["image_mode"] = op
+        if op == "resize":
+            await query.edit_message_text(
+                "📐 <b>RESIZE IMAGE</b>\n\nSend the target size first, like:\n<code>1280x720</code>\nThen send the image.\n\nThe image will be resized to fit inside those dimensions while keeping its aspect ratio.",
+                parse_mode="HTML", reply_markup=image_mode_keyboard()
+            )
+        else:
+            labels = {"compress":"🗜️ Compress", "jpg":"🔄 Convert to JPG", "png":"🟦 Convert to PNG", "webp":"🌐 Convert to WebP", "crop":"✂️ Crop Square"}
+            await query.edit_message_text(
+                f"{labels[op]}\n\n📸 Send the image you want to process.",
+                reply_markup=image_mode_keyboard()
+            )
+
+def parse_resize(text):
+    import re
+    m = re.fullmatch(r"\s*(\d{1,5})\s*[xX×]\s*(\d{1,5})\s*", text or "")
+    if not m:
+        return None
+    w, h = int(m.group(1)), int(m.group(2))
+    if not (16 <= w <= 10000 and 16 <= h <= 10000):
+        return None
+    return w, h
+
+async def process_image(update, context):
+    mode = context.user_data.get("image_mode")
+    if not mode or mode == "menu":
+        await image_tools_command(update, context)
+        return
+    msg = await update.effective_message.reply_text("🖼️ Processing image…")
+    user_id = update.effective_user.id
+    temp_dir = tempfile.mkdtemp(prefix=f"img_{user_id}_")
+    src = os.path.join(temp_dir, f"source_{uuid.uuid4().hex}")
+    out = None
+    try:
+        media = update.message.photo[-1] if update.message.photo else update.message.document
+        if not media or not (update.message.photo or (update.message.document.mime_type or "").startswith("image/")):
+            await msg.edit_text("❌ Please send a valid image.")
+            return
+        file = await context.bot.get_file(media.file_id)
+        await file.download_to_drive(src)
+        with Image.open(src) as im:
+            im.load()
+            original_size = im.size
+            if mode == "resize":
+                target = context.user_data.get("image_resize_target")
+                if not target:
+                    await msg.edit_text("📐 Send the target size first, for example: <code>1280x720</code>", parse_mode="HTML")
+                    context.user_data["image_waiting_size"] = True
+                    return
+                tw, th = target
+                image = ImageOps.contain(im, (tw, th), Image.Resampling.LANCZOS)
+                ext, fmt, mime = "png", "PNG", "image/png"
+                if im.mode in ("RGB", "L"):
+                    ext, fmt, mime = "jpg", "JPEG", "image/jpeg"
+                    image = image.convert("RGB")
+            elif mode == "compress":
+                image = im.copy()
+                if image.mode not in ("RGB", "L"):
+                    image = image.convert("RGB")
+                ext, fmt, mime = "jpg", "JPEG", "image/jpeg"
+            elif mode == "crop":
+                image = ImageOps.fit(im, (min(im.size), min(im.size)), method=Image.Resampling.LANCZOS, centering=(0.5,0.5))
+                if image.mode not in ("RGB", "L"):
+                    image = image.convert("RGB")
+                ext, fmt, mime = "jpg", "JPEG", "image/jpeg"
+            else:
+                image = im.copy()
+                if mode == "jpg":
+                    if image.mode not in ("RGB", "L"):
+                        image = image.convert("RGB")
+                    ext, fmt, mime = "jpg", "JPEG", "image/jpeg"
+                elif mode == "png":
+                    ext, fmt, mime = "png", "PNG", "image/png"
+                else:
+                    ext, fmt, mime = "webp", "WEBP", "image/webp"
+                    if image.mode not in ("RGB", "RGBA", "L"):
+                        image = image.convert("RGB")
+            out = os.path.join(temp_dir, f"result_{uuid.uuid4().hex}.{ext}")
+            save_kwargs = {"optimize": True}
+            if fmt == "JPEG": save_kwargs.update(quality=72, progressive=True)
+            elif fmt == "WEBP": save_kwargs.update(quality=80, method=6)
+            image.save(out, format=fmt, **save_kwargs)
+        before = os.path.getsize(src)
+        after = os.path.getsize(out)
+        await msg.edit_text(f"✅ <b>Done!</b>\n\n📏 {original_size[0]}×{original_size[1]}\n💾 {before/1024:.1f} KB → {after/1024:.1f} KB", parse_mode="HTML")
+        with open(out, "rb") as fh:
+            await update.effective_message.reply_document(document=fh, filename=os.path.basename(out), caption="🖼️ Image Tools • Completed")
+        log_activity(user_id, "image_tool", mode)
+    except Exception as exc:
+        print("Image Tool Error:", repr(exc))
+        try:
+            await msg.edit_text("❌ <b>Image processing failed.</b>\n\nPlease try another image.", parse_mode="HTML")
+        except Exception:
+            pass
+    finally:
+        context.user_data["image_mode"] = None
+        context.user_data["image_resize_target"] = None
+        context.user_data["image_waiting_size"] = False
+        try:
+            for name in os.listdir(temp_dir):
+                os.remove(os.path.join(temp_dir, name))
+            os.rmdir(temp_dir)
+        except OSError:
+            pass
+
+# ==================================================
 # MAIN MENU
 # ==================================================
 
@@ -1221,6 +1407,7 @@ def get_main_keyboard(language="en", is_admin_user=False):
         "downloader": "📥 𝗗𝗼𝘄𝗻𝗹𝗼𝗮𝗱𝗲𝗿",
         "scanner": "📷 𝗤𝗥 𝗦𝗰𝗮𝗻𝗻𝗲𝗿",
         "generator": "🔲 𝗤𝗥 𝗚𝗲𝗻𝗲𝗿𝗮𝘁𝗼𝗿",
+        "image": "🖼️ 𝗜𝗺𝗮𝗴𝗲 𝗧𝗼𝗼𝗹𝘀",
         "stats": "📊 𝗠𝘆 𝗦𝘁𝗮𝘁𝘀",
         "profile": "👤 𝗠𝘆 𝗣𝗿𝗼𝗳𝗶𝗹𝗲",
         "more": "🤖 𝗠𝗼𝗿𝗲 𝗕𝗼𝘁𝘀",
@@ -1235,10 +1422,10 @@ def get_main_keyboard(language="en", is_admin_user=False):
 
     keyboard = [
         [btn(labels["downloader"], "primary"), btn(labels["scanner"], "primary")],
-        [btn(labels["generator"], "primary"), btn(labels["more"], "success")],
-        [btn(labels["profile"]), btn(labels["stats"])],
-        [btn(labels["history"]), btn(labels["settings"])],
-        [btn(labels["help"])],
+        [btn(labels["generator"], "primary"), btn(labels["image"], "success")],
+        [btn(labels["more"], "success"), btn(labels["profile"])],
+        [btn(labels["stats"]), btn(labels["history"])],
+        [btn(labels["settings"]), btn(labels["help"])],
     ]
     if is_admin_user:
         keyboard.append([btn(labels["admin"], "primary")])
@@ -1400,17 +1587,6 @@ async def admin_help_callback(update, context):
     await query.answer()
     await query.edit_message_text(ADMIN_HELP_PAGES[page], parse_mode="HTML", reply_markup=admin_help_keyboard(page))
 
-async def admin_menu_command(update, context):
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        return
-    lang = get_user_language(user.id)
-    await update.effective_message.reply_text(
-        "🛡️ <b>ADMIN MENU</b>\n\nChoose an admin option below.",
-        parse_mode="HTML",
-        reply_markup=get_main_keyboard(lang, True),
-    )
-
 async def settings_command(update, context):
     await update.effective_message.reply_text("⚙️ *Settings*\n\nChoose your language:", reply_markup=settings_keyboard(), parse_mode="Markdown")
 
@@ -1428,6 +1604,8 @@ async def ui_text_action(update, context, text):
         await qr_scanner_start(update, context); return True
     if text == "🔲 𝗤𝗥 𝗚𝗲𝗻𝗲𝗿𝗮𝘁𝗼𝗿":
         await qr_generator_start(update, context); return True
+    if text == "🖼️ 𝗜𝗺𝗮𝗴𝗲 𝗧𝗼𝗼𝗹𝘀":
+        await image_tools_command(update, context); return True
     if text == "📊 𝗠𝘆 𝗦𝘁𝗮𝘁𝘀":
         messages, scans, generated, downloads = get_user_stats(user.id)
         msg = f"📊 *My Statistics*\n\n💬 Messages: *{messages}*\n📷 QR Scans: *{scans}*\n🔲 QR Generated: *{generated}*\n🎵 TikTok Downloads: *{downloads}*"
@@ -1442,7 +1620,7 @@ async def ui_text_action(update, context, text):
         await settings_command(update, context); return True
     if text == "❓ 𝗛𝗲𝗹𝗽":
         await help_command(update, context); return True
-    if text in {"🛡️ 𝗔𝗱𝗺𝗶𝗻 𝗖𝗼𝗺𝗺𝗮𝗻𝗱𝘀", "🛡️ Admin Commands"}:
+    if text == "🛡️ 𝗔𝗱𝗺𝗶𝗻 𝗖𝗼𝗺𝗺𝗮𝗻𝗱𝘀":
         return await admin_help_button(update, context)
     return False
 
@@ -1465,6 +1643,10 @@ def reset_modes(context):
     context.user_data["tiktok_mode"] = False
     context.user_data["tiktok_url"] = None
     context.user_data["tiktok_formats"] = None
+
+    context.user_data["image_mode"] = None
+    context.user_data["image_waiting_size"] = False
+    context.user_data["image_resize_target"] = None
 
 
 # ==================================================
@@ -2296,6 +2478,16 @@ async def handle_text(
     if await support_message(update, context):
         return
 
+    if context.user_data.get("image_waiting_size"):
+        target = parse_resize(text)
+        if not target:
+            await update.message.reply_text("❌ Invalid size. Use format like <code>1280x720</code>.", parse_mode="HTML")
+            return
+        context.user_data["image_resize_target"] = target
+        context.user_data["image_waiting_size"] = False
+        await update.message.reply_text(f"✅ Size set to <b>{target[0]}×{target[1]}</b>. Now send the image.", parse_mode="HTML", reply_markup=image_mode_keyboard())
+        return
+
     # ==========================================
     # QR SCANNER BUTTON
     # ==========================================
@@ -2415,6 +2607,29 @@ async def handle_text(
 
 
 # ==================================================
+# RUNTIME HEALTH / AUTO RECOVERY
+# ==================================================
+
+async def runtime_heartbeat(context):
+    touch_heartbeat()
+
+def recovery_watchdog():
+    global RECOVERY_RESTARTING
+    # Separate thread: if the asyncio loop/polling layer stops making progress
+    # for a sustained period, replace the process so Render can bring it back.
+    while True:
+        time.sleep(30)
+        if heartbeat_age() > 180 and not RECOVERY_RESTARTING:
+            RECOVERY_RESTARTING = True
+            print("🚨 Bot heartbeat stale for >180s; restarting process for recovery...")
+            try:
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+            except Exception as exc:
+                print(f"Recovery restart failed: {exc!r}")
+                RECOVERY_RESTARTING = False
+
+
+# ==================================================
 # MAIN
 # ==================================================
 
@@ -2471,17 +2686,18 @@ def main():
     app.add_handler(CommandHandler("cancelschedule", cancel_schedule_command))
     app.add_handler(CommandHandler("reply", reply_user_command))
     app.add_handler(CommandHandler("settings", settings_command))
-    app.add_handler(CommandHandler("admin_menu", admin_menu_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("profile", user_profile_command))
     app.add_handler(CommandHandler("mystats", user_stats_view))
     app.add_handler(CommandHandler("history", user_features_command))
     app.add_handler(CommandHandler("morebots", more_bots_command))
+    app.add_handler(CommandHandler("imagetools", image_tools_command))
     app.add_handler(CommandHandler("addbot", addbot_command))
     app.add_handler(CommandHandler("bots", bots_command))
     app.add_handler(CallbackQueryHandler(ui_callback, pattern=r"^(ui_|lang_|user_profile$|user_stats$|hist_(downloads|scans|generates|activity)$)"))
     app.add_handler(CallbackQueryHandler(admin_help_callback, pattern=r"^admin_help_[123]$"))
     app.add_handler(CallbackQueryHandler(morebot_callback, pattern=r"^morebot_(view|delete)_\d+$|^more_bots$"))
+    app.add_handler(CallbackQueryHandler(image_callback, pattern=r"^image_(menu|compress|resize|convert_jpg|convert_png|convert_webp|crop)$"))
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^(admin_|set_)"))
 
     # ==========================================
@@ -2510,12 +2726,17 @@ def main():
     # QR IMAGES
     # ==========================================
 
-    app.add_handler(
-        MessageHandler(
-            filters.PHOTO | filters.Document.IMAGE,
-            handle_qr_image
-        )
-    )
+    async def handle_media_image(update, context):
+        if context.user_data.get("image_mode") in {"compress", "resize", "jpg", "png", "webp", "crop"}:
+            if context.user_data.get("image_mode") == "resize" and not context.user_data.get("image_resize_target"):
+                await update.effective_message.reply_text("📐 Please send the target size first, e.g. <code>1280x720</code>.", parse_mode="HTML")
+                context.user_data["image_waiting_size"] = True
+                return
+            await process_image(update, context)
+        else:
+            await handle_qr_image(update, context)
+
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_media_image))
 
     # ==========================================
     # START BOT
@@ -2527,15 +2748,19 @@ def main():
 
     # Render Web Service needs an open port.
     Thread(target=start_web_server, daemon=True).start()
+    Thread(target=recovery_watchdog, daemon=True).start()
 
     app.add_error_handler(error_monitor)
     # Automatic command menu: users do not need /start to discover the latest commands.
     async def post_init(application):
         from telegram import BotCommand, BotCommandScopeChat
+        touch_heartbeat()
+        if application.job_queue:
+            application.job_queue.run_repeating(runtime_heartbeat, interval=30, first=0, name="runtime_heartbeat")
         default_commands = [
             BotCommand("start", "Open main menu"), BotCommand("help", "Help"), BotCommand("profile", "My Profile"),
             BotCommand("mystats", "My Statistics"), BotCommand("history", "My History"), BotCommand("settings", "Settings"),
-            BotCommand("support", "Contact Admin"), BotCommand("morebots", "More Bots")
+            BotCommand("support", "Contact Admin"), BotCommand("morebots", "More Bots"), BotCommand("imagetools", "Image Tools")
         ]
         await application.bot.set_my_commands(default_commands)
         admin_commands = default_commands + [BotCommand("admin", "Admin Panel"), BotCommand("status", "Admin system status"), BotCommand("addbot", "Add More Bot"), BotCommand("bots", "Manage More Bots")]
@@ -2558,7 +2783,15 @@ def main():
                 except Exception as exc:
                     save_error(aid, "schedule_restore", repr(exc))
     app.post_init = post_init
-    app.run_polling()
+    try:
+        app.run_polling()
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        save_error(0, "polling_crash", traceback.format_exc())
+        print(f"🚨 Polling stopped unexpectedly: {exc!r}")
+        # Replace the process so Render sees a fresh bot process.
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 # ==================================================
